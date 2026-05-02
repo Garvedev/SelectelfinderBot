@@ -1,3 +1,4 @@
+```yaml id="5m2t8q"
 name: Deploy
 
 on:
@@ -37,4 +38,11 @@ jobs:
       - name: Run deploy
         run: |
           set -euo pipefail
-          ssh -i ~/.ssh/id_ed25519 -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" "cd '$DEPLOY_PATH' && sudo ./deploy.sh"
+
+          ssh -i ~/.ssh/id_ed25519 -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" "
+            cd '$DEPLOY_PATH' &&
+            ls -la &&
+            chmod +x '$DEPLOY_PATH/deploy.sh' &&
+            sudo bash '$DEPLOY_PATH/deploy.sh'
+          "
+```
