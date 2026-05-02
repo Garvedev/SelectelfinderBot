@@ -1,9 +1,9 @@
-```yaml id="5m2t8q"
 name: Deploy
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:
@@ -22,27 +22,18 @@ jobs:
       - name: Configure SSH
         run: |
           set -euo pipefail
-
-          test -n "$DEPLOY_HOST" || (echo "DEPLOY_HOST is empty" && exit 1)
-          test -n "$DEPLOY_PORT" || (echo "DEPLOY_PORT is empty" && exit 1)
-          test -n "$DEPLOY_USER" || (echo "DEPLOY_USER is empty" && exit 1)
-          test -n "$DEPLOY_PATH" || (echo "DEPLOY_PATH is empty" && exit 1)
-          test -n "$DEPLOY_SSH_KEY" || (echo "DEPLOY_SSH_KEY is empty" && exit 1)
+          test -n "$DEPLOY_HOST"
+          test -n "$DEPLOY_PORT"
+          test -n "$DEPLOY_USER"
+          test -n "$DEPLOY_PATH"
+          test -n "$DEPLOY_SSH_KEY"
 
           mkdir -p ~/.ssh
           printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-
           ssh-keyscan -p "$DEPLOY_PORT" -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
 
       - name: Run deploy
         run: |
           set -euo pipefail
-
-          ssh -i ~/.ssh/id_ed25519 -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" "
-            cd '$DEPLOY_PATH' &&
-            ls -la &&
-            chmod +x '$DEPLOY_PATH/deploy.sh' &&
-            sudo bash '$DEPLOY_PATH/deploy.sh'
-          "
-```
+          ssh -i ~/.ssh/id_ed25519 -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" "cd '$DEPLOY_PATH' && chmod +x deploy.sh && sudo bash deploy.sh"
