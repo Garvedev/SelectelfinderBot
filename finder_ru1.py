@@ -792,7 +792,12 @@ def get_connection(region):
         interface=OS_INTERFACE,
         identity_api_version=OS_IDENTITY_API_VERSION,
         compute_api_version=OS_COMPUTE_API_VERSION,
+
+        # prevent Selectel API hangs
+        connect_retries=2,
+        api_timeout=30,
     )
+
 
 
 def region_env(name: str, region: str) -> str:
