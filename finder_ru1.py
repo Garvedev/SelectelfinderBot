@@ -9,6 +9,7 @@ import base64
 import secrets
 import gc
 import io
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -421,23 +422,34 @@ def cmd_log(message):
         bot.reply_to(message, "⛔ Access denied")
         return
 
-    if not LOG_FILE.exists():
-        bot.reply_to(message, f"❌ Лог-файл не найден: {LOG_FILE}")
-        return
-
     try:
-        lines = LOG_FILE.read_text(encoding="utf-8", errors="ignore").splitlines()[-200:]
-        text = "\n".join(lines)
+        source = str(LOG_FILE)
+        text = ""
+
+        if LOG_FILE.exists():
+            lines = LOG_FILE.read_text(encoding="utf-8", errors="ignore").splitlines()[-200:]
+            text = "\n".join(lines)
+        else:
+            # Fallback for older deployments where stdout/stderr only go to journald.
+            source = "journalctl -u finder"
+            result = subprocess.run(
+                ["journalctl", "-u", "finder", "-n", "200", "--no-pager"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            text = result.stdout or ""
+
         if not text.strip():
-            bot.reply_to(message, "📜 Лог-файл пока пустой")
-            return
-        if len(text) <= 3500:
-            bot.reply_to(message, f"📜 Последние логи:\n\n```text\n{text}\n```", parse_mode="Markdown")
+            bot.reply_to(message, f"📜 Логи пустые или недоступны: {source}")
             return
 
+        # Отправляем файлом, чтобы Telegram Markdown не ломался на спецсимволах из логов.
         data = io.BytesIO((text + "\n").encode("utf-8"))
         data.name = "finder_last_200_lines.log"
-        bot.send_document(message.chat.id, data, caption="📜 Последние 200 строк логов")
+        bot.send_document(message.chat.id, data, caption=f"📜 Последние 200 строк логов ({source})")
     except Exception as e:
         bot.reply_to(message, f"⚠️ Не удалось отправить логи: {e}")
 
