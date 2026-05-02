@@ -1,0 +1,11 @@
+.env
+rc_*.sh
+ipwhitelist_safe_cidr.txt
+good_ips.txt
+good_ips.tmp
+banned_ips.txt
+approved_vless_keys.txt
+ipwhitelist_safe_cidr.tmp
+__pycache__/
+*.pyc
+.venv/

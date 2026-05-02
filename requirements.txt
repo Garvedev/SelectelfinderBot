@@ -1,0 +1,5 @@
+python-openstackclient
+openstacksdk
+pyTelegramBotAPI
+requests[socks]
+python-dotenv

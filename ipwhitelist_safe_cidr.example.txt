@@ -1,0 +1,4 @@
+# Upload the real target list through Telegram with /upload.
+# One IP or CIDR per line:
+1.2.3.4
+5.6.7.0/24
