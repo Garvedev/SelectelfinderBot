@@ -506,7 +506,41 @@ git diff
 
 ## Будущий автодеплой
 
-Следующий этап:
+В проект добавлен GitHub Actions workflow:
+
+```text
+.github/workflows/deploy.yml
+```
+
+Он запускается на push в `main` и вручную через `workflow_dispatch`.
+
+Для работы нужно добавить в приватный GitHub repository secrets:
+
+```text
+DEPLOY_HOST       # IP или hostname сервера
+DEPLOY_PORT       # SSH port, обычно 22
+DEPLOY_USER       # пользователь для SSH
+DEPLOY_SSH_KEY    # приватный SSH key без passphrase или key, поддерживаемый CI
+DEPLOY_PATH       # путь к проекту на сервере, например /opt/selectel-finder
+```
+
+На сервере пользователь `DEPLOY_USER` должен уметь:
+
+- заходить по SSH с этим ключом;
+- читать приватный git-репозиторий;
+- выполнять `sudo ./deploy.sh` без интерактивного ввода пароля.
+
+Минимальная схема:
+
+1. Создать приватный репозиторий.
+2. Push проекта.
+3. На сервере клонировать репозиторий в `DEPLOY_PATH`.
+4. Создать серверный `.env`.
+5. Один раз выполнить `sudo ./deploy.sh`.
+6. Добавить GitHub secrets.
+7. Следующие push в `main` будут запускать deploy автоматически.
+
+Первичная последовательность:
 
 1. Создать git-репозиторий.
 2. Проверить `.gitignore`.
