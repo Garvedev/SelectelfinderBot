@@ -344,9 +344,20 @@ def cmd_start(message):
         bot.reply_to(message, f"⚠️ Не могу запустить поиск: {e}")
         return
 
-    slots_left = remaining_slots()
-    if slots_left <= 0:
-        bot.reply_to(message, f"✅ Уже есть {approved_count()}/{TARGET_COUNT} рабочих ключей. Добор не нужен.")
+    approved, existing_candidates, left_to_find = remaining_ips_to_find(networks)
+    if approved >= TARGET_COUNT:
+        bot.reply_to(message, f"✅ Уже есть {approved}/{TARGET_COUNT} рабочих ключей. Добор не нужен.")
+        return
+
+    if left_to_find <= 0:
+        bot.reply_to(
+            message,
+            "✅ Кандидаты уже набраны. Поиск не нужен.\n"
+            f"✅ Принято ключей: {approved}/{TARGET_COUNT}\n"
+            f"📦 Найдено кандидатов: {existing_candidates}/{TARGET_COUNT - approved}\n\n"
+            "Чтобы создать серверы и выдать ключи, нажми /create_servers.",
+            reply_markup=create_servers_keyboard(),
+        )
         return
 
     if not get_selected_regions():
@@ -360,8 +371,9 @@ def cmd_start(message):
         message,
         "🚀 Поиск IP запущен\n"
         f"🎯 Целей: {len(networks)}\n"
-        f"✅ Уже принято: {approved_count()}/{TARGET_COUNT}\n"
-        f"📦 Нужно добрать: {slots_left}\n"
+        f"✅ Принято ключей: {approved}/{TARGET_COUNT}\n"
+        f"📦 Уже найдено кандидатов: {existing_candidates}/{TARGET_COUNT - approved}\n"
+        f"🔎 Осталось найти IP: {left_to_find}\n"
         f"🌍 Регионы: {format_regions()}",
     )
 
@@ -391,8 +403,10 @@ def cmd_status(message):
         networks = None
         whitelist_status = f"ошибка: {e}"
 
-    slots_left = remaining_slots()
+    approved = approved_count()
+    slots_left = max(TARGET_COUNT - approved, 0)
     count = sync_good_ips(networks, exclude_approved=True)
+    left_to_find = max(slots_left - count, 0)
     state = "работает" if running else "остановлен"
     fs = get_finder_state()
 
@@ -407,8 +421,9 @@ def cmd_status(message):
         f"🌐 Последний IP: {fs.get('last_ip') or '-'}\n"
         f"⚠️ Последняя ошибка: {fs.get('last_error') or '-'}\n"
         f"🕒 Запущен: {fs.get('started_at') or '-'}\n"
-        f"✅ Принято ключей: {approved_count()}/{TARGET_COUNT}\n"
-        f"📦 Новых кандидатов: {count}/{slots_left}\n"
+        f"✅ Принято ключей: {approved}/{TARGET_COUNT}\n"
+        f"📦 Найдено кандидатов: {count}/{slots_left}\n"
+        f"🔎 Осталось найти IP: {left_to_find}\n"
         f"🎯 Целей в файле: {whitelist_status}\n"
         f"🌍 Регионы: {format_regions()}\n"
         f"🧪 Создание серверов: {provision_state}\n"
@@ -893,7 +908,21 @@ def approved_count() -> int:
 
 
 def remaining_slots() -> int:
+    """How many approved keys are still needed to reach TARGET_COUNT."""
     return max(TARGET_COUNT - approved_count(), 0)
+
+
+def remaining_ips_to_find(networks=None) -> tuple[int, int, int]:
+    """Return (approved, candidates, left_to_find).
+
+    TARGET_COUNT is the final number of working keys.
+    good_ips.txt contains candidates that have already been found but not yet checked.
+    Therefore finder should search only: TARGET_COUNT - approved - candidates.
+    """
+    approved = approved_count()
+    candidates = count_matching_good_ips(networks, exclude_approved=True)
+    left_to_find = max(TARGET_COUNT - approved - candidates, 0)
+    return approved, candidates, left_to_find
 
 
 def count_good_ips() -> int:
