@@ -1148,6 +1148,49 @@ def delete_floating_ip_address(conn, address: str, ip_id: str = ""):
         delete_floating_ip(conn, target)
 
 
+def get_server_ports(conn, server_id: str):
+    """Return Neutron ports attached to a server."""
+    return list(conn.network.ports(device_id=server_id))
+
+
+def attach_floating_ip_to_server(conn, server, floating_ip_address: str):
+    """Attach floating IP through Neutron instead of Nova server action.
+
+    Selectel may return 404 for Nova /servers/<id>/action when using
+    conn.compute.add_floating_ip_to_server(). Updating the floating IP port_id
+    through Neutron is more reliable.
+    """
+    server_id = getattr(server, "id", "")
+    if not server_id:
+        raise RuntimeError("Server has no id, cannot attach floating IP")
+
+    ports = get_server_ports(conn, server_id)
+    if not ports:
+        raise RuntimeError(f"No Neutron ports found for server {server_id}")
+
+    port = ports[0]
+    floating_ip = find_floating_ip(conn, floating_ip_address)
+    if not floating_ip:
+        raise RuntimeError(f"Floating IP not found: {floating_ip_address}")
+
+    conn.network.update_ip(floating_ip, port_id=port.id)
+    print(
+        f"✅ Floating IP привязан через Neutron: {floating_ip_address} -> port {port.id}",
+        flush=True,
+    )
+
+
+def detach_floating_ip_from_server(conn, floating_ip_address: str):
+    """Detach floating IP through Neutron."""
+    floating_ip = find_floating_ip(conn, floating_ip_address)
+    if not floating_ip:
+        return
+
+    if getattr(floating_ip, "port_id", None):
+        conn.network.update_ip(floating_ip, port_id=None)
+        print(f"✅ Floating IP отвязан через Neutron: {floating_ip_address}", flush=True)
+
+
 def provision_region_env(name: str, region: str) -> str:
     return region_env(f"PROVISION_{name}", region)
 
@@ -1405,7 +1448,7 @@ def create_test_server(conn, record: GoodIpRecord):
         try:
             server = conn.compute.create_server(**attrs)
             server = conn.compute.wait_for_server(server, wait=PROVISION_SERVER_WAIT_SECONDS)
-            conn.compute.add_floating_ip_to_server(server, record.ip)
+            attach_floating_ip_to_server(conn, server, record.ip)
 
             print(
                 f"✅ Сервер создан: {server_name}, "
@@ -1445,7 +1488,7 @@ def cleanup_test_server(conn, server_id: str, ip: str):
         if not server:
             return
         try:
-            conn.compute.remove_floating_ip_from_server(server, ip)
+            detach_floating_ip_from_server(conn, ip)
         except Exception as e:
             print(f"⚠️ Не удалось отвязать floating IP {ip}: {e}", flush=True)
         conn.compute.delete_server(server, ignore_missing=True)
