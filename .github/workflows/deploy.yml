@@ -17,23 +17,36 @@ jobs:
       DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
       DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
       DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      ENV_FILE: ${{ secrets.ENV_FILE }}
 
     steps:
       - name: Configure SSH
         run: |
           set -euo pipefail
+
           test -n "$DEPLOY_HOST"
           test -n "$DEPLOY_PORT"
           test -n "$DEPLOY_USER"
           test -n "$DEPLOY_PATH"
           test -n "$DEPLOY_SSH_KEY"
+          test -n "$ENV_FILE"
 
           mkdir -p ~/.ssh
           printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
+
           ssh-keyscan -p "$DEPLOY_PORT" -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: Upload .env from GitHub Secret
+        run: |
+          set -euo pipefail
+
+          printf '%s\n' "$ENV_FILE" | ssh -i ~/.ssh/id_ed25519 -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" \
+            "cat > '$DEPLOY_PATH/.env' && chmod 600 '$DEPLOY_PATH/.env'"
 
       - name: Run deploy
         run: |
           set -euo pipefail
-          ssh -i ~/.ssh/id_ed25519 -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" "cd '$DEPLOY_PATH' && chmod +x deploy.sh && sudo bash deploy.sh"
+
+          ssh -i ~/.ssh/id_ed25519 -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" \
+            "cd '$DEPLOY_PATH' && chmod +x deploy.sh && sudo bash deploy.sh"

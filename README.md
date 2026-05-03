@@ -1,54 +1,37 @@
 # Selectel Finder Bot
 
-Telegram-бот для поиска подходящих Selectel Floating IP, загрузки whitelist IP/CIDR, выбора регионов, ручного запуска создания серверов и выдачи VLESS-ключей.
+Telegram-бот для поиска подходящих Selectel Floating IP, загрузки целевого списка IP/CIDR из файла, выбора регионов поиска и автоматической проверки найденных IP через временные облачные серверы.
 
-Бот работает с OpenStack API Selectel: создает Floating IP, проверяет попадание IP в whitelist, сохраняет подходящие IP в `good_ips.txt`, ведет ban-list и список подтвержденных ключей. После нахождения нужного количества IP бот останавливает поиск и ждет отдельной команды или кнопки для создания серверов.
-
-## Что изменено в текущей версии
-
-- `/status` теперь показывает текущую попытку, текущий регион, последний IP, последнюю ошибку и время запуска поиска.
-- Добавлена команда `/log`, которая отправляет последние 200 строк логов.
-- Добавлен файл логов `finder.log`, путь настраивается через `LOG_FILE`.
-- После нахождения нужного количества кандидатов бот больше не создает серверы автоматически.
-- После достижения цели бот останавливается, отправляет отчет и показывает кнопку `🚀 Создать серверы и выдать ключи`.
-- Добавлена команда `/create_servers` для ручного запуска создания серверов и выдачи ключей.
-- Добавлено явное закрытие OpenStack-соединений после операций, чтобы снизить рост RAM.
-- Добавлен периодический `gc.collect()` в рабочем цикле.
-- Сохранена логика ручной проверки VLESS-кнопками `Работает` / `Не работает`.
+Бот работает с OpenStack API Selectel, создает и удаляет Floating IP, ведет списки найденных, забаненных и подтвержденных IP, а после заполнения свободных слотов может создать временный Ubuntu-сервер, установить forwarding-скрипт и отправить VLESS-ключ в Telegram на ручную проверку.
 
 ## Возможности
 
-- Управление из Telegram-группы или личного чата.
+- Управление из Telegram-группы или чата.
 - Доступ только для одного разрешенного `TELEGRAM_ALLOWED_CHAT_ID`.
-- Запуск и остановка поиска через `/start` и `/stop`.
 - Загрузка файла с IP/CIDR только после команды `/upload`.
 - Выбор регионов поиска кнопками через `/regions`.
 - Поиск Floating IP только из загруженного whitelist.
 - Бан-лист плохих IP: при повторном выпадении такие IP сразу удаляются.
 - Добор только свободных слотов: если уже есть 4 рабочих ключа из 11, бот ищет только 7 новых кандидатов.
-- Ручной запуск создания серверов после нахождения IP.
-- Создание временного Ubuntu-сервера в Selectel для проверки VLESS.
+- Автоматический provisioning временного сервера в Selectel для проверки VLESS.
 - Создание preemptible-сервера там, где Selectel поддерживает этот тип.
 - Отправка VLESS-ключа в Telegram с кнопками `Работает` / `Не работает`.
 - Сохранение рабочих ключей в локальный файл.
 - Автоудаление временного сервера после проверки.
-- Просмотр последних логов прямо из Telegram через `/log`.
 
 ## Структура проекта
 
 ```text
 .
-├── finder_ru1.py                      # основной Telegram/OpenStack бот
-├── ipwhitelist_safe_cidr.example.txt  # пример списка целевых IP/CIDR
-├── requirements.txt                   # Python-зависимости
-├── deploy.sh                          # серверный deploy/update скрипт
-├── rc.example.sh                      # пример Selectel OpenStack rc-файла
+├── finder_ru1.py                 # основной Telegram/OpenStack бот
+├── ipwhitelist_safe_cidr.example.txt # пример списка целевых IP/CIDR
+├── requirements.txt              # Python-зависимости
+├── deploy.sh                     # серверный deploy/update скрипт
+├── rc.example.sh                 # пример Selectel OpenStack rc-файла
 ├── systemd/
-│   └── finder.service                 # systemd unit template
-├── .github/workflows/deploy.yml       # GitHub Actions deploy
-├── .env.example                       # пример конфигурации без секретов
-├── .gitignore
-└── README.md
+│   └── finder.service            # systemd unit template
+├── .env.example                  # пример конфигурации без секретов
+└── .gitignore
 ```
 
 Файлы состояния создаются во время работы и не должны попадать в git:
@@ -60,7 +43,6 @@ ipwhitelist_safe_cidr.txt
 good_ips.txt
 banned_ips.txt
 approved_vless_keys.txt
-finder.log
 *.tmp
 .venv/
 __pycache__/
@@ -150,7 +132,7 @@ SOCKS5_PROXY=
 Если нужен SOCKS5:
 
 ```env
-SOCKS5_PROXY=socks5h://user:password@host:port
+SOCKS5_PROXY=socks5://user:password@host:port
 ```
 
 ## Настройка Selectel/OpenStack
@@ -183,10 +165,9 @@ OS_PASSWORD='password$with$specials'
 
 ```env
 TARGET_COUNT=11
-REGIONS=ru-1,ru-3,ru-7,ru-9
+REGIONS=ru-1,ru-2,ru-3,ru-6,ru-7,ru-8,ru-9
 GOOD_IP_SYNC_INTERVAL=300
 WHITELIST_MAX_BYTES=1048576
-LOG_FILE=/opt/selectel-finder/finder.log
 ```
 
 `TARGET_COUNT` означает общее количество рабочих ключей, а не количество новых IP на каждый запуск.
@@ -196,19 +177,6 @@ LOG_FILE=/opt/selectel-finder/finder.log
 - `TARGET_COUNT=11`;
 - в `approved_vless_keys.txt` уже есть 4 рабочих ключа;
 - бот будет искать только 7 новых кандидатов.
-
-Рекомендуемые стабильные регионы сейчас:
-
-```env
-REGIONS=ru-1,ru-3,ru-7,ru-9
-```
-
-Проблемные регионы, которые часто дают таймауты Selectel API:
-
-```text
-ru-6
-ru-8
-```
 
 ## Telegram-команды
 
@@ -222,31 +190,7 @@ ru-8
 /status
 ```
 
-Показать состояние поиска, текущую попытку, текущий регион, последний IP, последнюю ошибку, количество принятых ключей, новых кандидатов, выбранные регионы и ban-list.
-
-```text
-/log
-```
-
-Показать последние 200 строк логов. Если сообщение слишком длинное, бот отправит лог файлом.
-
-```text
-/start
-```
-
-Запустить поиск. Команда начинает реальные операции с Selectel Floating IP.
-
-```text
-/stop
-```
-
-Остановить поиск.
-
-```text
-/create_servers
-```
-
-Создать серверы и выдать ключи из уже найденных IP-кандидатов. Эта команда запускается вручную после того, как Finder нашел нужное количество IP.
+Показать состояние поиска, количество принятых ключей, новых кандидатов, регионов и бан-листа.
 
 ```text
 /upload
@@ -267,28 +211,22 @@ ru-8
 Открыть кнопки выбора регионов.
 
 ```text
+/start
+```
+
+Запустить поиск. Команда начинает реальные операции с Selectel Floating IP.
+
+```text
+/stop
+```
+
+Остановить поиск.
+
+```text
 /sync
 ```
 
 Сверить `good_ips.txt` с OpenStack и удалить устаревшие записи.
-
-## Новый сценарий работы
-
-1. Запустить бота или systemd service.
-2. В Telegram отправить `/status`.
-3. При необходимости отправить `/upload` и загрузить whitelist IP/CIDR.
-4. Настроить регионы через `/regions`.
-5. Отправить `/start`.
-6. Бот ищет Floating IP и сохраняет подходящие IP в `good_ips.txt`.
-7. Когда найдено достаточно кандидатов, бот останавливает Finder.
-8. Бот отправляет отчет и кнопку `🚀 Создать серверы и выдать ключи`.
-9. Нажать кнопку или отправить `/create_servers`.
-10. Бот начинает создавать серверы и присылать VLESS-ключи.
-11. Проверить каждый ключ вручную.
-12. Нажать `Работает` или `Не работает`.
-13. Повторять до заполнения `TARGET_COUNT` рабочих ключей.
-
-Важно: серверы больше не создаются автоматически сразу после нахождения 11 IP. Это специально сделано, чтобы сначала остановить Finder, проверить список кандидатов и только потом запускать создание серверов.
 
 ## Загрузка файла с IP/CIDR
 
@@ -342,73 +280,12 @@ ru-8
 ## Логика поиска IP
 
 1. Бот выбирает случайный регион из выбранных.
-2. Увеличивает счетчик попыток и обновляет состояние для `/status`.
-3. Создает Floating IP в этом регионе.
-4. Проверяет, входит ли IP в текущий whitelist.
-5. Если IP подходит, сохраняет его в `good_ips.txt`.
-6. Если IP не подходит, удаляет его из Selectel.
-7. Если IP в `banned_ips.txt`, сразу удаляет его.
-8. Когда новых кандидатов достаточно для свободных слотов, поиск останавливается.
-9. Бот отправляет отчет и кнопку ручного запуска создания серверов.
-
-## Логи
-
-Логи пишутся одновременно:
-
-- в `journalctl` через systemd;
-- в файл `finder.log`.
-
-Путь задается переменной:
-
-```env
-LOG_FILE=/opt/selectel-finder/finder.log
-```
-
-Посмотреть логи на сервере:
-
-```bash
-sudo journalctl -u finder -f
-```
-
-Посмотреть последние логи из Telegram:
-
-```text
-/log
-```
-
-Если лог стал слишком большим, можно очистить его:
-
-```bash
-sudo truncate -s 0 /opt/selectel-finder/finder.log
-```
-
-## RAM и OpenStack-соединения
-
-В текущей версии добавлены меры против постепенного роста RAM:
-
-- OpenStack connection закрывается после операций;
-- connection закрывается при ошибках;
-- периодически вызывается `gc.collect()`;
-- `/log` читает только последние 200 строк.
-
-Проверить память процесса:
-
-```bash
-pgrep -af finder_ru1.py
-ps -o pid,user,%mem,rss,vsz,etime,cmd -p <PID>
-```
-
-Следить в динамике:
-
-```bash
-watch -n 10 'ps -o pid,user,%mem,rss,vsz,etime,cmd -p <PID>'
-```
-
-В `htop` несколько строк с одинаковой командой могут быть потоками одного Python-процесса. Точное количество процессов лучше проверять так:
-
-```bash
-ps aux | grep finder_ru1.py
-```
+2. Создает Floating IP в этом регионе.
+3. Проверяет, входит ли IP в текущий whitelist.
+4. Если IP подходит, сохраняет его в `good_ips.txt`.
+5. Если IP не подходит, удаляет его из Selectel.
+6. Если IP в `banned_ips.txt`, сразу удаляет его.
+7. Когда новых кандидатов достаточно для свободных слотов, поиск останавливается и запускается VLESS-проверка.
 
 ## Слоты, approved и ban
 
@@ -422,28 +299,16 @@ ps aux | grep finder_ru1.py
 
 `good_ips.txt` содержит новые подходящие IP-кандидаты, которые еще надо проверить.
 
-## Ручное создание серверов и VLESS-проверка
+## Автоматическая VLESS-проверка
 
-Когда найдено достаточно новых кандидатов, бот останавливает Finder и ждет ручного действия.
-
-Запуск можно сделать двумя способами:
-
-```text
-/create_servers
-```
-
-или кнопкой:
-
-```text
-🚀 Создать серверы и выдать ключи
-```
+Когда найдено достаточно новых кандидатов, бот запускает provisioning.
 
 Настройки:
 
 ```env
 PROVISION_ENABLED=true
 PROVISION_ORIGIN_IP=YOUR_ORIGIN_IP
-PROVISION_VLESS_TEMPLATE=vless://UUID@{WHITE_IP}:443?...#user
+PROVISION_VLESS_TEMPLATE='vless://UUID@{WHITE_IP}:443?...#user'
 PROVISION_PREEMPTIBLE_REGIONS=ru-1,ru-3,ru-7,ru-8
 PROVISION_ALLOW_NON_PREEMPTIBLE=false
 PROVISION_SERVER_NAME_PREFIX=selectel-finder
@@ -513,13 +378,26 @@ PROVISION_ALLOW_NON_PREEMPTIBLE=true
 По умолчанию бот пытается найти:
 
 ```env
-PROVISION_IMAGE_NAME=Ubuntu 24.04 LTS 64-bit
+PROVISION_IMAGE_NAME='Ubuntu 24.04 LTS 64-bit'
 PROVISION_REQUIRE_LOCAL_DISK=true
 ```
 
-Flavor выбирается автоматически: минимальный по vCPU, RAM и disk, с локальным диском.
+Flavor выбирается автоматически: бот пробует самый маленький flavor по vCPU, RAM и disk, с локальным диском. Если Selectel возвращает ошибку вроде `The requested availability zone is not suitable for the requested instance type`, бот пробует следующий подходящий flavor.
+
+По умолчанию бот больше не выбирает availability zone автоматически. Если `PROVISION_AVAILABILITY_ZONE` пустой, Selectel/OpenStack сам выбирает подходящую зону. Это снижает риск ошибки несовместимости зоны и типа инстанса.
 
 Сеть выбирается автоматически: первая приватная сеть в регионе.
+
+Настройки fallback-подбора flavor:
+
+```env
+PROVISION_AUTO_FLAVOR_FALLBACK=true
+PROVISION_MAX_FLAVOR_ATTEMPTS=10
+```
+
+`PROVISION_AUTO_FLAVOR_FALLBACK=true` означает: если выбранный или самый маленький flavor не подошёл, бот попробует следующий.
+
+`PROVISION_MAX_FLAVOR_ATTEMPTS=10` ограничивает количество попыток на один IP, чтобы бот не перебирал слишком много вариантов.
 
 Если нужно зафиксировать ресурсы явно:
 
@@ -528,6 +406,8 @@ PROVISION_IMAGE_ID=
 PROVISION_FLAVOR_ID=
 PROVISION_NETWORK_ID=
 PROVISION_AVAILABILITY_ZONE=
+PROVISION_AUTO_FLAVOR_FALLBACK=true
+PROVISION_MAX_FLAVOR_ATTEMPTS=10
 ```
 
 Можно задать региональные override-переменные. В суффиксе региона `-` заменяется на `_`:
@@ -538,6 +418,36 @@ PROVISION_FLAVOR_ID_RU_1=
 PROVISION_NETWORK_ID_RU_1=
 PROVISION_AVAILABILITY_ZONE_RU_1=
 ```
+
+
+### Ошибка availability zone / instance type
+
+Если Selectel возвращает:
+
+```text
+The requested availability zone is not suitable for the requested instance type
+```
+
+бот не останавливает весь процесс проверки. Он:
+
+1. оставляет найденный Floating IP в `good_ips.txt`;
+2. пишет ошибку в лог;
+3. пробует следующий flavor;
+4. если все попытки не подошли, отправляет ошибку в Telegram и переходит дальше.
+
+Если нужно принудительно указать зону, можно задать:
+
+```env
+PROVISION_AVAILABILITY_ZONE=ru-3a
+```
+
+или регионально:
+
+```env
+PROVISION_AVAILABILITY_ZONE_RU_3=ru-3a
+```
+
+Если зона не указана, бот передаёт `availability_zone=auto` и позволяет Selectel выбрать подходящую зону самостоятельно.
 
 ## Server deploy через systemd
 
@@ -584,90 +494,14 @@ sudo journalctl -u finder -f
 
 ## Обновление на сервере
 
-После push в git автодеплой GitHub Actions должен сам обновить сервер.
-
-Ручной deploy на сервере:
+После push в git:
 
 ```bash
 cd /opt/selectel-finder
 sudo ./deploy.sh
 ```
 
-## GitHub Actions deploy
-
-Workflow лежит здесь:
-
-```text
-.github/workflows/deploy.yml
-```
-
-Он запускается на push в `main` и вручную через `workflow_dispatch`.
-
-Для работы нужны GitHub repository secrets:
-
-```text
-DEPLOY_HOST       # IP или hostname сервера
-DEPLOY_PORT       # SSH port, обычно 22
-DEPLOY_USER       # пользователь для SSH, сейчас root
-DEPLOY_SSH_KEY    # приватный SSH key
-DEPLOY_PATH       # путь к проекту, например /opt/selectel-finder
-```
-
-На сервере пользователь `DEPLOY_USER` должен уметь:
-
-- заходить по SSH с этим ключом;
-- читать приватный git-репозиторий;
-- выполнять `sudo bash deploy.sh` без интерактивного ввода пароля.
-
-## Как выложить изменения в GitHub
-
-Проверить изменения:
-
-```bash
-git status
-git diff
-```
-
-Добавить только безопасные файлы:
-
-```bash
-git add finder_ru1.py README.md .env.example deploy.sh requirements.txt ipwhitelist_safe_cidr.example.txt rc.example.sh .gitignore .gitattributes systemd/finder.service .github/workflows/deploy.yml
-```
-
-Не добавлять секреты и рабочие файлы:
-
-```text
-.env
-rc_ru1.sh
-ipwhitelist_safe_cidr.txt
-good_ips.txt
-banned_ips.txt
-approved_vless_keys.txt
-finder.log
-```
-
-Commit и push:
-
-```bash
-git commit -m "Update finder status, logs and manual provisioning"
-git push origin main
-```
-
-После push GitHub Actions должен выполнить deploy на сервер.
-
-Проверка после deploy:
-
-```bash
-sudo systemctl status finder --no-pager
-sudo journalctl -u finder -n 100 --no-pager
-```
-
-В Telegram:
-
-```text
-/status
-/log
-```
+Когда будет настроен автодеплой, этот же скрипт можно вызывать из webhook/CI.
 
 ## Проверки перед запуском
 
@@ -684,7 +518,6 @@ python -c "import finder_ru1; print('import ok')"
 /status
 /help
 /regions
-/log
 ```
 
 Не отправляйте `/start`, пока не готовы к реальному созданию и удалению Floating IP.
@@ -692,9 +525,7 @@ python -c "import finder_ru1; print('import ok')"
 ## Безопасность
 
 - Не коммитьте `.env`.
-- Не коммитьте `rc_ru1.sh`, если там реальные project id / user domain.
-- Не коммитьте `ipwhitelist_safe_cidr.txt`, если это рабочий список.
-- Не коммитьте `good_ips.txt`, `banned_ips.txt`, `approved_vless_keys.txt`, `finder.log`.
+- Не коммитьте `good_ips.txt`, `banned_ips.txt`, `approved_vless_keys.txt`.
 - Если токен Telegram или пароль Selectel попал в переписку, скриншот или git, перевыпустите его.
 - Храните OpenStack пароль в одинарных кавычках, если в нем есть `$`.
 - Перед публичным push проверьте:
@@ -704,3 +535,64 @@ git status
 git diff --cached
 git diff
 ```
+
+## Типовой сценарий работы
+
+1. Запустить бота.
+2. В Telegram отправить `/status`.
+3. Отправить `/upload`.
+4. Загрузить файл с IP/CIDR.
+5. Настроить регионы через `/regions`.
+6. Отправить `/start`.
+7. Дождаться поиска новых кандидатов.
+8. После получения VLESS-ключа проверить его вручную.
+9. Нажать `Работает` или `Не работает`.
+10. Повторять до заполнения `TARGET_COUNT` рабочих ключей.
+
+## Будущий автодеплой
+
+В проект добавлен GitHub Actions workflow:
+
+```text
+.github/workflows/deploy.yml
+```
+
+Он запускается на push в `main` и вручную через `workflow_dispatch`.
+
+Для работы нужно добавить в приватный GitHub repository secrets:
+
+```text
+DEPLOY_HOST       # IP или hostname сервера
+DEPLOY_PORT       # SSH port, обычно 22
+DEPLOY_USER       # пользователь для SSH
+DEPLOY_SSH_KEY    # приватный SSH key без passphrase или key, поддерживаемый CI
+DEPLOY_PATH       # путь к проекту на сервере, например /opt/selectel-finder
+```
+
+На сервере пользователь `DEPLOY_USER` должен уметь:
+
+- заходить по SSH с этим ключом;
+- читать приватный git-репозиторий;
+- выполнять `sudo ./deploy.sh` без интерактивного ввода пароля.
+
+Минимальная схема:
+
+1. Создать приватный репозиторий.
+2. Push проекта.
+3. На сервере клонировать репозиторий в `DEPLOY_PATH`.
+4. Создать серверный `.env`.
+5. Один раз выполнить `sudo ./deploy.sh`.
+6. Добавить GitHub secrets.
+7. Следующие push в `main` будут запускать deploy автоматически.
+
+Первичная последовательность:
+
+1. Создать git-репозиторий.
+2. Проверить `.gitignore`.
+3. Сделать первый commit.
+4. Создать remote.
+5. Push проекта.
+6. На сервере клонировать репозиторий в `/opt/selectel-finder`.
+7. Настроить `.env` на сервере.
+8. Запустить `sudo ./deploy.sh`.
+9. Подключить webhook или CI, который будет вызывать deploy после push.

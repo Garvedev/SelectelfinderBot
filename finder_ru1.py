@@ -7,9 +7,6 @@ import re
 import threading
 import base64
 import secrets
-import gc
-import io
-import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -23,36 +20,6 @@ try:
     sys.stderr.reconfigure(encoding="utf-8")
 except Exception:
     pass
-
-
-class TeeStream:
-    def __init__(self, *streams):
-        self.streams = streams
-
-    def write(self, data):
-        for stream in self.streams:
-            try:
-                stream.write(data)
-                stream.flush()
-            except Exception:
-                pass
-
-    def flush(self):
-        for stream in self.streams:
-            try:
-                stream.flush()
-            except Exception:
-                pass
-
-
-def setup_file_logging():
-    try:
-        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        log_stream = open(LOG_FILE, "a", encoding="utf-8", buffering=1)
-        sys.stdout = TeeStream(sys.__stdout__, log_stream)
-        sys.stderr = TeeStream(sys.__stderr__, log_stream)
-    except Exception as e:
-        print(f"⚠️ Не удалось включить файл логов {LOG_FILE}: {e}", flush=True)
 
 
 # =========================
@@ -69,7 +36,6 @@ WHITELIST_FILE = BASE_DIR / "ipwhitelist_safe_cidr.txt"
 GOOD_IPS_FILE = BASE_DIR / "good_ips.txt"
 BANNED_IPS_FILE = BASE_DIR / "banned_ips.txt"
 APPROVED_KEYS_FILE = BASE_DIR / "approved_vless_keys.txt"
-LOG_FILE = Path(os.getenv("LOG_FILE", str(BASE_DIR / "finder.log")).strip() or str(BASE_DIR / "finder.log"))
 
 
 def required_env(name: str) -> str:
@@ -157,6 +123,8 @@ PROVISION_NETWORK_NAME = optional_env("PROVISION_NETWORK_NAME")
 PROVISION_SECURITY_GROUP = optional_env("PROVISION_SECURITY_GROUP", "selectel-finder-proxy")
 PROVISION_KEY_NAME = optional_env("PROVISION_KEY_NAME")
 PROVISION_AVAILABILITY_ZONE = optional_env("PROVISION_AVAILABILITY_ZONE")
+PROVISION_AUTO_FLAVOR_FALLBACK = bool_env("PROVISION_AUTO_FLAVOR_FALLBACK", True)
+PROVISION_MAX_FLAVOR_ATTEMPTS = int_env("PROVISION_MAX_FLAVOR_ATTEMPTS", 10)
 PROVISION_SERVER_WAIT_SECONDS = int_env("PROVISION_SERVER_WAIT_SECONDS", 300)
 PROVISION_SETUP_WAIT_SECONDS = int_env("PROVISION_SETUP_WAIT_SECONDS", 120, minimum=0)
 PROVISION_DECISION_TIMEOUT = int_env("PROVISION_DECISION_TIMEOUT", 300)
@@ -172,24 +140,6 @@ waiting_for_whitelist_file = False
 provisioning_running = False
 provisioning_lock = threading.RLock()
 pending_vless_tests = {}
-finder_state_lock = threading.RLock()
-finder_state = {
-    "current_attempt": 0,
-    "current_region": "",
-    "last_ip": "",
-    "last_error": "",
-    "started_at": "",
-}
-
-
-def update_finder_state(**kwargs):
-    with finder_state_lock:
-        finder_state.update(kwargs)
-
-
-def get_finder_state() -> dict:
-    with finder_state_lock:
-        return dict(finder_state)
 
 
 # =========================
@@ -200,8 +150,6 @@ if SOCKS5_PROXY:
     telebot.apihelper.proxy = {
         "https": SOCKS5_PROXY
     }
-
-setup_file_logging()
 
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
@@ -291,17 +239,6 @@ def region_keyboard():
     return keyboard
 
 
-def create_servers_keyboard():
-    keyboard = types.InlineKeyboardMarkup(row_width=1)
-    keyboard.add(
-        types.InlineKeyboardButton(
-            "🚀 Создать серверы и выдать ключи",
-            callback_data="provision:start",
-        )
-    )
-    return keyboard
-
-
 def regions_text() -> str:
     return (
         "🌍 Регионы поиска\n"
@@ -315,9 +252,7 @@ def help_text() -> str:
         "Команды:\n"
         "/start — запустить поиск\n"
         "/stop — остановить поиск\n"
-        "/status — статус, текущая попытка и настройки\n"
-        "/log — показать последние логи\n"
-        "/create_servers — создать серверы и выдать ключи из найденных IP\n"
+        "/status — статус и текущие настройки\n"
         "/upload — загрузить файл с IP/CIDR\n"
         "/cancel — отменить ожидание файла\n"
         "/regions — выбрать регионы\n"
@@ -344,20 +279,9 @@ def cmd_start(message):
         bot.reply_to(message, f"⚠️ Не могу запустить поиск: {e}")
         return
 
-    approved, existing_candidates, left_to_find = remaining_ips_to_find(networks)
-    if approved >= TARGET_COUNT:
-        bot.reply_to(message, f"✅ Уже есть {approved}/{TARGET_COUNT} рабочих ключей. Добор не нужен.")
-        return
-
-    if left_to_find <= 0:
-        bot.reply_to(
-            message,
-            "✅ Кандидаты уже набраны. Поиск не нужен.\n"
-            f"✅ Принято ключей: {approved}/{TARGET_COUNT}\n"
-            f"📦 Найдено кандидатов: {existing_candidates}/{TARGET_COUNT - approved}\n\n"
-            "Чтобы создать серверы и выдать ключи, нажми /create_servers.",
-            reply_markup=create_servers_keyboard(),
-        )
+    slots_left = remaining_slots()
+    if slots_left <= 0:
+        bot.reply_to(message, f"✅ Уже есть {approved_count()}/{TARGET_COUNT} рабочих ключей. Добор не нужен.")
         return
 
     if not get_selected_regions():
@@ -366,14 +290,12 @@ def cmd_start(message):
 
     last_good_ip_sync = 0
     running = True
-    update_finder_state(current_attempt=0, current_region="", last_ip="", last_error="", started_at=time.strftime("%Y-%m-%d %H:%M:%S"))
     bot.reply_to(
         message,
         "🚀 Поиск IP запущен\n"
         f"🎯 Целей: {len(networks)}\n"
-        f"✅ Принято ключей: {approved}/{TARGET_COUNT}\n"
-        f"📦 Уже найдено кандидатов: {existing_candidates}/{TARGET_COUNT - approved}\n"
-        f"🔎 Осталось найти IP: {left_to_find}\n"
+        f"✅ Уже принято: {approved_count()}/{TARGET_COUNT}\n"
+        f"📦 Нужно добрать: {slots_left}\n"
         f"🌍 Регионы: {format_regions()}",
     )
 
@@ -403,92 +325,22 @@ def cmd_status(message):
         networks = None
         whitelist_status = f"ошибка: {e}"
 
-    approved = approved_count()
-    slots_left = max(TARGET_COUNT - approved, 0)
+    slots_left = remaining_slots()
     count = sync_good_ips(networks, exclude_approved=True)
-    left_to_find = max(slots_left - count, 0)
     state = "работает" if running else "остановлен"
-    fs = get_finder_state()
-
     with provisioning_lock:
         provision_state = "идет" if provisioning_running else "ожидает"
 
     bot.reply_to(
         message,
         f"📊 Статус: {state}\n"
-        f"🔁 Попытка: {fs.get('current_attempt') or 0}\n"
-        f"🌍 Текущий регион: {fs.get('current_region') or '-'}\n"
-        f"🌐 Последний IP: {fs.get('last_ip') or '-'}\n"
-        f"⚠️ Последняя ошибка: {fs.get('last_error') or '-'}\n"
-        f"🕒 Запущен: {fs.get('started_at') or '-'}\n"
-        f"✅ Принято ключей: {approved}/{TARGET_COUNT}\n"
-        f"📦 Найдено кандидатов: {count}/{slots_left}\n"
-        f"🔎 Осталось найти IP: {left_to_find}\n"
+        f"✅ Принято ключей: {approved_count()}/{TARGET_COUNT}\n"
+        f"📦 Новых кандидатов: {count}/{slots_left}\n"
         f"🎯 Целей в файле: {whitelist_status}\n"
         f"🌍 Регионы: {format_regions()}\n"
-        f"🧪 Создание серверов: {provision_state}\n"
+        f"🧪 VLESS-проверка: {provision_state}\n"
         f"🚫 Бан-лист: {len(load_banned_ips())}"
     )
-
-
-@bot.message_handler(commands=["log"])
-def cmd_log(message):
-    if not allowed(message):
-        bot.reply_to(message, "⛔ Access denied")
-        return
-
-    try:
-        source = str(LOG_FILE)
-        text = ""
-
-        if LOG_FILE.exists():
-            lines = LOG_FILE.read_text(encoding="utf-8", errors="ignore").splitlines()[-200:]
-            text = "\n".join(lines)
-        else:
-            # Fallback for older deployments where stdout/stderr only go to journald.
-            source = "journalctl -u finder"
-            result = subprocess.run(
-                ["journalctl", "-u", "finder", "-n", "200", "--no-pager"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                timeout=10,
-                check=False,
-            )
-            text = result.stdout or ""
-
-        if not text.strip():
-            bot.reply_to(message, f"📜 Логи пустые или недоступны: {source}")
-            return
-
-        # Отправляем файлом, чтобы Telegram Markdown не ломался на спецсимволах из логов.
-        data = io.BytesIO((text + "\n").encode("utf-8"))
-        data.name = "finder_last_200_lines.log"
-        bot.send_document(message.chat.id, data, caption=f"📜 Последние 200 строк логов ({source})")
-    except Exception as e:
-        bot.reply_to(message, f"⚠️ Не удалось отправить логи: {e}")
-
-
-@bot.message_handler(commands=["create_servers"])
-def cmd_create_servers(message):
-    if not allowed(message):
-        bot.reply_to(message, "⛔ Access denied")
-        return
-
-    try:
-        networks = load_whitelist()
-    except Exception as e:
-        bot.reply_to(message, f"⚠️ Не могу загрузить whitelist: {e}")
-        return
-
-    candidates = count_matching_good_ips(networks, exclude_approved=True)
-    slots_left = remaining_slots()
-    if candidates <= 0:
-        bot.reply_to(message, "⚠️ Нет найденных IP-кандидатов для создания серверов")
-        return
-
-    bot.reply_to(message, f"🚀 Запускаю создание серверов и выдачу ключей для {min(candidates, slots_left)} IP")
-    start_provisioning_if_needed(networks)
 
 
 @bot.message_handler(commands=["sync"])
@@ -593,26 +445,6 @@ def callback_regions(call):
             message_id=call.message.message_id,
             reply_markup=region_keyboard(),
         )
-    except Exception as e:
-        bot.answer_callback_query(call.id, str(e), show_alert=True)
-
-
-@bot.callback_query_handler(func=lambda call: call.data == "provision:start")
-def callback_create_servers(call):
-    if str(call.message.chat.id) != str(TELEGRAM_ALLOWED_CHAT_ID):
-        bot.answer_callback_query(call.id, "Access denied", show_alert=True)
-        return
-
-    try:
-        networks = load_whitelist()
-        candidates = count_matching_good_ips(networks, exclude_approved=True)
-        slots_left = remaining_slots()
-        if candidates <= 0:
-            bot.answer_callback_query(call.id, "Нет найденных IP", show_alert=True)
-            return
-        bot.answer_callback_query(call.id, "Запускаю создание серверов")
-        send(TELEGRAM_ALLOWED_CHAT_ID, f"🚀 Запускаю создание серверов и выдачу ключей для {min(candidates, slots_left)} IP")
-        start_provisioning_if_needed(networks)
     except Exception as e:
         bot.answer_callback_query(call.id, str(e), show_alert=True)
 
@@ -908,21 +740,7 @@ def approved_count() -> int:
 
 
 def remaining_slots() -> int:
-    """How many approved keys are still needed to reach TARGET_COUNT."""
     return max(TARGET_COUNT - approved_count(), 0)
-
-
-def remaining_ips_to_find(networks=None) -> tuple[int, int, int]:
-    """Return (approved, candidates, left_to_find).
-
-    TARGET_COUNT is the final number of working keys.
-    good_ips.txt contains candidates that have already been found but not yet checked.
-    Therefore finder should search only: TARGET_COUNT - approved - candidates.
-    """
-    approved = approved_count()
-    candidates = count_matching_good_ips(networks, exclude_approved=True)
-    left_to_find = max(TARGET_COUNT - approved - candidates, 0)
-    return approved, candidates, left_to_find
 
 
 def count_good_ips() -> int:
@@ -983,21 +801,6 @@ def get_connection(region):
     )
 
 
-def close_connection(conn):
-    if not conn:
-        return
-    try:
-        close = getattr(conn, "close", None)
-        if callable(close):
-            close()
-            return
-        session = getattr(conn, "session", None) or getattr(conn, "_session", None)
-        session_close = getattr(session, "close", None)
-        if callable(session_close):
-            session_close()
-    except Exception:
-        pass
-
 
 def region_env(name: str, region: str) -> str:
     suffix = region.upper().replace("-", "_")
@@ -1037,18 +840,14 @@ def get_floating_network(conn, region):
 
 def create_floating_ip(region):
     conn = get_connection(region)
+    network = get_floating_network(conn, region)
 
-    try:
-        network = get_floating_network(conn, region)
-        ip = conn.network.create_ip(floating_network_id=network.id)
+    ip = conn.network.create_ip(floating_network_id=network.id)
 
-        address = ip.floating_ip_address
-        ip_id = ip.id
+    address = ip.floating_ip_address
+    ip_id = ip.id
 
-        return conn, ip_id, address
-    except Exception:
-        close_connection(conn)
-        raise
+    return conn, ip_id, address
 
 
 def delete_floating_ip(conn, ip_id):
@@ -1059,7 +858,6 @@ def delete_floating_ip(conn, ip_id):
 
 
 def saved_ip_active(record: GoodIpRecord) -> bool:
-    conn = None
     try:
         conn = get_connection(record.region)
 
@@ -1076,8 +874,6 @@ def saved_ip_active(record: GoodIpRecord) -> bool:
     except Exception as e:
         print(f"⚠️ Не удалось проверить сохраненный IP {record.ip}: {e}", flush=True)
         return True
-    finally:
-        close_connection(conn)
 
 
 def sync_good_ips(networks=None, exclude_approved=False) -> int:
@@ -1185,38 +981,56 @@ def get_provision_image(conn, region):
     raise RuntimeError(f"No active Ubuntu image found in {region}")
 
 
-def get_provision_flavor(conn, region):
+def flavor_sort_key(flavor):
+    return (
+        getattr(flavor, "vcpus", 10**9) or 10**9,
+        getattr(flavor, "ram", 10**9) or 10**9,
+        getattr(flavor, "disk", 10**9) or 10**9,
+        str(getattr(flavor, "name", "")),
+    )
+
+
+def get_candidate_flavors(conn, region):
+    """Return flavors to try, ordered from smallest to larger ones.
+
+    If PROVISION_FLAVOR_ID/NAME or regional override is set, that flavor is tried first.
+    When PROVISION_AUTO_FLAVOR_FALLBACK=true, the bot also tries other suitable flavors
+    if the selected one is rejected by Selectel.
+    """
     flavor_id = provision_region_env("FLAVOR_ID", region) or PROVISION_FLAVOR_ID
     flavor_name = provision_region_env("FLAVOR_NAME", region) or PROVISION_FLAVOR_NAME
+    selected_flavor = None
 
     if flavor_id:
-        flavor = conn.compute.find_flavor(flavor_id, ignore_missing=True)
-        if flavor:
-            return flavor
-        raise RuntimeError(f"Flavor id not found in {region}: {flavor_id}")
+        selected_flavor = conn.compute.find_flavor(flavor_id, ignore_missing=True)
+        if not selected_flavor:
+            raise RuntimeError(f"Flavor id not found in {region}: {flavor_id}")
 
-    if flavor_name:
-        flavor = conn.compute.find_flavor(flavor_name, ignore_missing=True)
-        if flavor:
-            return flavor
-        raise RuntimeError(f"Flavor not found in {region}: {flavor_name}")
+    if flavor_name and not selected_flavor:
+        selected_flavor = conn.compute.find_flavor(flavor_name, ignore_missing=True)
+        if not selected_flavor:
+            raise RuntimeError(f"Flavor not found in {region}: {flavor_name}")
 
     flavors = list(conn.compute.flavors())
     if PROVISION_REQUIRE_LOCAL_DISK:
         flavors = [flavor for flavor in flavors if (getattr(flavor, "disk", 0) or 0) > 0]
 
+    if selected_flavor:
+        selected_id = getattr(selected_flavor, "id", "")
+        rest = [flavor for flavor in flavors if getattr(flavor, "id", "") != selected_id]
+        rest.sort(key=flavor_sort_key)
+        flavors = [selected_flavor] + (rest if PROVISION_AUTO_FLAVOR_FALLBACK else [])
+    else:
+        flavors.sort(key=flavor_sort_key)
+
     if not flavors:
         raise RuntimeError(f"No suitable flavors found in {region}")
 
-    flavors.sort(
-        key=lambda flavor: (
-            getattr(flavor, "vcpus", 10**9) or 10**9,
-            getattr(flavor, "ram", 10**9) or 10**9,
-            getattr(flavor, "disk", 10**9) or 10**9,
-            str(getattr(flavor, "name", "")),
-        )
-    )
-    return flavors[0]
+    return flavors[:PROVISION_MAX_FLAVOR_ATTEMPTS]
+
+
+def get_provision_flavor(conn, region):
+    return get_candidate_flavors(conn, region)[0]
 
 
 def get_provision_network(conn, region):
@@ -1248,18 +1062,14 @@ def get_provision_network(conn, region):
     return networks[0]
 
 
-def get_provision_availability_zone(conn, region):
-    availability_zone = provision_region_env("AVAILABILITY_ZONE", region) or PROVISION_AVAILABILITY_ZONE
-    if availability_zone:
-        return availability_zone
+def get_explicit_provision_availability_zone(region):
+    """Return only the explicitly configured availability zone.
 
-    zones = [getattr(zone, "name", "") for zone in conn.compute.availability_zones(details=False)]
-    zones = [zone for zone in zones if zone]
-    for zone in zones:
-        if zone.startswith(region):
-            return zone
-
-    return zones[0] if zones else None
+    Selectel may reject a flavor when an automatically selected AZ is unsuitable.
+    Therefore the bot does not auto-pick AZ anymore; if this value is empty,
+    OpenStack/Selectel chooses a suitable zone itself.
+    """
+    return provision_region_env("AVAILABILITY_ZONE", region) or PROVISION_AVAILABILITY_ZONE
 
 
 def ensure_security_group(conn):
@@ -1344,18 +1154,14 @@ def create_test_server(conn, record: GoodIpRecord):
         )
 
     image = get_provision_image(conn, region)
-    flavor = get_provision_flavor(conn, region)
+    flavors = get_candidate_flavors(conn, region)
     network = get_provision_network(conn, region)
     security_group = ensure_security_group(conn)
-    availability_zone = get_provision_availability_zone(conn, region)
-
-    server_name = f"{PROVISION_SERVER_NAME_PREFIX}-{region}-{record.ip.replace('.', '-')}-{int(time.time())}"
+    availability_zone = get_explicit_provision_availability_zone(region)
     user_data = base64.b64encode(make_cloud_init_script().encode("utf-8")).decode("ascii")
 
-    attrs = {
-        "name": server_name,
+    base_attrs = {
         "image_id": image.id,
-        "flavor_id": flavor.id,
         "networks": [{"uuid": network.id}],
         "security_groups": [{"name": security_group.name}],
         "user_data": user_data,
@@ -1363,27 +1169,68 @@ def create_test_server(conn, record: GoodIpRecord):
     }
 
     if availability_zone:
-        attrs["availability_zone"] = availability_zone
+        base_attrs["availability_zone"] = availability_zone
     if PROVISION_KEY_NAME:
-        attrs["key_name"] = PROVISION_KEY_NAME
+        base_attrs["key_name"] = PROVISION_KEY_NAME
     if preemptible:
-        attrs["tags"] = ["preemptible"]
+        base_attrs["tags"] = ["preemptible"]
 
-    print(
-        f"🚀 Создаю сервер {server_name}: region={region}, "
-        f"image={getattr(image, 'name', image.id)}, flavor={getattr(flavor, 'name', flavor.id)}, "
-        f"network={getattr(network, 'name', network.id)}, preemptible={preemptible}",
-        flush=True,
+    last_error = None
+
+    for index, flavor in enumerate(flavors, 1):
+        server = None
+        server_name = (
+            f"{PROVISION_SERVER_NAME_PREFIX}-{region}-{record.ip.replace('.', '-')}-"
+            f"{int(time.time())}-{index}"
+        )
+        attrs = dict(base_attrs)
+        attrs["name"] = server_name
+        attrs["flavor_id"] = flavor.id
+
+        print(
+            f"🚀 Пробую сервер {server_name}: region={region}, "
+            f"image={getattr(image, 'name', image.id)}, "
+            f"flavor={getattr(flavor, 'name', flavor.id)}, "
+            f"network={getattr(network, 'name', network.id)}, "
+            f"preemptible={preemptible}, "
+            f"availability_zone={availability_zone or 'auto'}, "
+            f"attempt={index}/{len(flavors)}",
+            flush=True,
+        )
+
+        try:
+            server = conn.compute.create_server(**attrs)
+            server = conn.compute.wait_for_server(server, wait=PROVISION_SERVER_WAIT_SECONDS)
+            conn.compute.add_floating_ip_to_server(server, record.ip)
+
+            print(
+                f"✅ Сервер создан: {server_name}, "
+                f"flavor={getattr(flavor, 'name', flavor.id)}",
+                flush=True,
+            )
+
+            if PROVISION_SETUP_WAIT_SECONDS:
+                time.sleep(PROVISION_SETUP_WAIT_SECONDS)
+
+            return server
+
+        except Exception as e:
+            last_error = e
+            flavor_name = getattr(flavor, "name", flavor.id)
+            print(f"⚠️ Flavor не подошёл {flavor_name}: {e}", flush=True)
+
+            if server:
+                try:
+                    cleanup_test_server(conn, getattr(server, "id", ""), record.ip)
+                except Exception as cleanup_error:
+                    print(f"⚠️ Cleanup после неудачной попытки не удался: {cleanup_error}", flush=True)
+
+            continue
+
+    raise RuntimeError(
+        f"Не удалось создать сервер в {region} после {len(flavors)} попыток. "
+        f"Последняя ошибка: {last_error}"
     )
-
-    server = conn.compute.create_server(**attrs)
-    server = conn.compute.wait_for_server(server, wait=PROVISION_SERVER_WAIT_SECONDS)
-    conn.compute.add_floating_ip_to_server(server, record.ip)
-
-    if PROVISION_SETUP_WAIT_SECONDS:
-        time.sleep(PROVISION_SETUP_WAIT_SECONDS)
-
-    return server
 
 
 def cleanup_test_server(conn, server_id: str, ip: str):
@@ -1466,8 +1313,6 @@ def run_single_vless_test(record: GoodIpRecord):
 
         if server and PROVISION_DELETE_SERVER_AFTER_RESULT:
             cleanup_test_server(conn, server.id, record.ip)
-
-        close_connection(conn)
 
 
 def provisioning_worker(records: list[GoodIpRecord]):
@@ -1584,16 +1429,14 @@ def finder_loop():
                     TELEGRAM_ALLOWED_CHAT_ID,
                     "🎯 Кандидаты для свободных слотов найдены\n"
                     f"✅ Принято ключей: {approved_count()}/{TARGET_COUNT}\n"
-                    f"📦 Новых кандидатов: {current_count}/{slots_left}\n\n"
-                    "Finder остановлен. Серверы еще НЕ созданы.",
-                    reply_markup=create_servers_keyboard(),
+                    f"📦 Новых кандидатов: {current_count}/{slots_left}",
                 )
+                start_provisioning_if_needed(whitelist)
                 time.sleep(5)
                 continue
 
             attempt += 1
             region = random.choice(regions)
-            update_finder_state(current_attempt=attempt, current_region=region, last_error="")
 
             print("=" * 70, flush=True)
             print(f"Попытка {attempt}", flush=True)
@@ -1607,7 +1450,6 @@ def finder_loop():
 
             try:
                 conn, ip_id, address = create_floating_ip(region)
-                update_finder_state(last_ip=address)
                 print(f"Получен IP: {address}", flush=True)
 
                 if is_banned_ip(address):
@@ -1635,16 +1477,11 @@ def finder_loop():
                     delete_floating_ip(conn, ip_id)
 
             except Exception as e:
-                update_finder_state(last_error=str(e))
                 print(f"⚠️ Ошибка создания IP в {region}:", flush=True)
                 print(e, flush=True)
 
                 if conn and ip_id:
                     delete_floating_ip(conn, ip_id)
-            finally:
-                close_connection(conn)
-                if attempt % 50 == 0:
-                    gc.collect()
 
             time.sleep(random.randint(5, 12))
 
