@@ -7,6 +7,9 @@ import re
 import threading
 import base64
 import secrets
+import gc
+import io
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -20,6 +23,36 @@ try:
     sys.stderr.reconfigure(encoding="utf-8")
 except Exception:
     pass
+
+
+class TeeStream:
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for stream in self.streams:
+            try:
+                stream.write(data)
+                stream.flush()
+            except Exception:
+                pass
+
+    def flush(self):
+        for stream in self.streams:
+            try:
+                stream.flush()
+            except Exception:
+                pass
+
+
+def setup_file_logging():
+    try:
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        log_stream = open(LOG_FILE, "a", encoding="utf-8", buffering=1)
+        sys.stdout = TeeStream(sys.__stdout__, log_stream)
+        sys.stderr = TeeStream(sys.__stderr__, log_stream)
+    except Exception as e:
+        print(f"⚠️ Не удалось включить файл логов {LOG_FILE}: {e}", flush=True)
 
 
 # =========================
@@ -36,6 +69,7 @@ WHITELIST_FILE = BASE_DIR / "ipwhitelist_safe_cidr.txt"
 GOOD_IPS_FILE = BASE_DIR / "good_ips.txt"
 BANNED_IPS_FILE = BASE_DIR / "banned_ips.txt"
 APPROVED_KEYS_FILE = BASE_DIR / "approved_vless_keys.txt"
+LOG_FILE = Path(os.getenv("LOG_FILE", str(BASE_DIR / "finder.log")).strip() or str(BASE_DIR / "finder.log"))
 
 
 def required_env(name: str) -> str:
@@ -140,6 +174,24 @@ waiting_for_whitelist_file = False
 provisioning_running = False
 provisioning_lock = threading.RLock()
 pending_vless_tests = {}
+finder_state_lock = threading.RLock()
+finder_state = {
+    "current_attempt": 0,
+    "current_region": "",
+    "last_ip": "",
+    "last_error": "",
+    "started_at": "",
+}
+
+
+def update_finder_state(**kwargs):
+    with finder_state_lock:
+        finder_state.update(kwargs)
+
+
+def get_finder_state() -> dict:
+    with finder_state_lock:
+        return dict(finder_state)
 
 
 # =========================
@@ -150,6 +202,8 @@ if SOCKS5_PROXY:
     telebot.apihelper.proxy = {
         "https": SOCKS5_PROXY
     }
+
+setup_file_logging()
 
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
@@ -239,6 +293,17 @@ def region_keyboard():
     return keyboard
 
 
+def create_servers_keyboard():
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(
+        types.InlineKeyboardButton(
+            "🚀 Создать серверы и выдать ключи",
+            callback_data="provision:start",
+        )
+    )
+    return keyboard
+
+
 def regions_text() -> str:
     return (
         "🌍 Регионы поиска\n"
@@ -252,7 +317,9 @@ def help_text() -> str:
         "Команды:\n"
         "/start — запустить поиск\n"
         "/stop — остановить поиск\n"
-        "/status — статус и текущие настройки\n"
+        "/status — статус, текущая попытка и настройки\n"
+        "/log — показать последние логи\n"
+        "/create_servers — создать серверы и выдать ключи из найденных IP\n"
         "/upload — загрузить файл с IP/CIDR\n"
         "/cancel — отменить ожидание файла\n"
         "/regions — выбрать регионы\n"
@@ -279,9 +346,20 @@ def cmd_start(message):
         bot.reply_to(message, f"⚠️ Не могу запустить поиск: {e}")
         return
 
-    slots_left = remaining_slots()
-    if slots_left <= 0:
-        bot.reply_to(message, f"✅ Уже есть {approved_count()}/{TARGET_COUNT} рабочих ключей. Добор не нужен.")
+    approved, existing_candidates, left_to_find = remaining_ips_to_find(networks)
+    if approved >= TARGET_COUNT:
+        bot.reply_to(message, f"✅ Уже есть {approved}/{TARGET_COUNT} рабочих ключей. Добор не нужен.")
+        return
+
+    if left_to_find <= 0:
+        bot.reply_to(
+            message,
+            "✅ Кандидаты уже набраны. Поиск не нужен.\n"
+            f"✅ Принято ключей: {approved}/{TARGET_COUNT}\n"
+            f"📦 Найдено кандидатов: {existing_candidates}/{TARGET_COUNT - approved}\n\n"
+            "Чтобы создать серверы и выдать ключи, нажми /create_servers.",
+            reply_markup=create_servers_keyboard(),
+        )
         return
 
     if not get_selected_regions():
@@ -290,12 +368,14 @@ def cmd_start(message):
 
     last_good_ip_sync = 0
     running = True
+    update_finder_state(current_attempt=0, current_region="", last_ip="", last_error="", started_at=time.strftime("%Y-%m-%d %H:%M:%S"))
     bot.reply_to(
         message,
         "🚀 Поиск IP запущен\n"
         f"🎯 Целей: {len(networks)}\n"
-        f"✅ Уже принято: {approved_count()}/{TARGET_COUNT}\n"
-        f"📦 Нужно добрать: {slots_left}\n"
+        f"✅ Принято ключей: {approved}/{TARGET_COUNT}\n"
+        f"📦 Уже найдено кандидатов: {existing_candidates}/{TARGET_COUNT - approved}\n"
+        f"🔎 Осталось найти IP: {left_to_find}\n"
         f"🌍 Регионы: {format_regions()}",
     )
 
@@ -325,22 +405,92 @@ def cmd_status(message):
         networks = None
         whitelist_status = f"ошибка: {e}"
 
-    slots_left = remaining_slots()
+    approved = approved_count()
+    slots_left = max(TARGET_COUNT - approved, 0)
     count = sync_good_ips(networks, exclude_approved=True)
+    left_to_find = max(slots_left - count, 0)
     state = "работает" if running else "остановлен"
+    fs = get_finder_state()
+
     with provisioning_lock:
         provision_state = "идет" if provisioning_running else "ожидает"
 
     bot.reply_to(
         message,
         f"📊 Статус: {state}\n"
-        f"✅ Принято ключей: {approved_count()}/{TARGET_COUNT}\n"
-        f"📦 Новых кандидатов: {count}/{slots_left}\n"
+        f"🔁 Попытка: {fs.get('current_attempt') or 0}\n"
+        f"🌍 Текущий регион: {fs.get('current_region') or '-'}\n"
+        f"🌐 Последний IP: {fs.get('last_ip') or '-'}\n"
+        f"⚠️ Последняя ошибка: {fs.get('last_error') or '-'}\n"
+        f"🕒 Запущен: {fs.get('started_at') or '-'}\n"
+        f"✅ Принято ключей: {approved}/{TARGET_COUNT}\n"
+        f"📦 Найдено кандидатов: {count}/{slots_left}\n"
+        f"🔎 Осталось найти IP: {left_to_find}\n"
         f"🎯 Целей в файле: {whitelist_status}\n"
         f"🌍 Регионы: {format_regions()}\n"
-        f"🧪 VLESS-проверка: {provision_state}\n"
+        f"🧪 Создание серверов: {provision_state}\n"
         f"🚫 Бан-лист: {len(load_banned_ips())}"
     )
+
+
+@bot.message_handler(commands=["log"])
+def cmd_log(message):
+    if not allowed(message):
+        bot.reply_to(message, "⛔ Access denied")
+        return
+
+    try:
+        source = str(LOG_FILE)
+        text = ""
+
+        if LOG_FILE.exists():
+            lines = LOG_FILE.read_text(encoding="utf-8", errors="ignore").splitlines()[-200:]
+            text = "\n".join(lines)
+        else:
+            # Fallback for older deployments where stdout/stderr only go to journald.
+            source = "journalctl -u finder"
+            result = subprocess.run(
+                ["journalctl", "-u", "finder", "-n", "200", "--no-pager"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            text = result.stdout or ""
+
+        if not text.strip():
+            bot.reply_to(message, f"📜 Логи пустые или недоступны: {source}")
+            return
+
+        # Отправляем файлом, чтобы Telegram Markdown не ломался на спецсимволах из логов.
+        data = io.BytesIO((text + "\n").encode("utf-8"))
+        data.name = "finder_last_200_lines.log"
+        bot.send_document(message.chat.id, data, caption=f"📜 Последние 200 строк логов ({source})")
+    except Exception as e:
+        bot.reply_to(message, f"⚠️ Не удалось отправить логи: {e}")
+
+
+@bot.message_handler(commands=["create_servers"])
+def cmd_create_servers(message):
+    if not allowed(message):
+        bot.reply_to(message, "⛔ Access denied")
+        return
+
+    try:
+        networks = load_whitelist()
+    except Exception as e:
+        bot.reply_to(message, f"⚠️ Не могу загрузить whitelist: {e}")
+        return
+
+    candidates = count_matching_good_ips(networks, exclude_approved=True)
+    slots_left = remaining_slots()
+    if candidates <= 0:
+        bot.reply_to(message, "⚠️ Нет найденных IP-кандидатов для создания серверов")
+        return
+
+    bot.reply_to(message, f"🚀 Запускаю создание серверов и выдачу ключей для {min(candidates, slots_left)} IP")
+    start_provisioning_if_needed(networks)
 
 
 @bot.message_handler(commands=["sync"])
@@ -445,6 +595,26 @@ def callback_regions(call):
             message_id=call.message.message_id,
             reply_markup=region_keyboard(),
         )
+    except Exception as e:
+        bot.answer_callback_query(call.id, str(e), show_alert=True)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "provision:start")
+def callback_create_servers(call):
+    if str(call.message.chat.id) != str(TELEGRAM_ALLOWED_CHAT_ID):
+        bot.answer_callback_query(call.id, "Access denied", show_alert=True)
+        return
+
+    try:
+        networks = load_whitelist()
+        candidates = count_matching_good_ips(networks, exclude_approved=True)
+        slots_left = remaining_slots()
+        if candidates <= 0:
+            bot.answer_callback_query(call.id, "Нет найденных IP", show_alert=True)
+            return
+        bot.answer_callback_query(call.id, "Запускаю создание серверов")
+        send(TELEGRAM_ALLOWED_CHAT_ID, f"🚀 Запускаю создание серверов и выдачу ключей для {min(candidates, slots_left)} IP")
+        start_provisioning_if_needed(networks)
     except Exception as e:
         bot.answer_callback_query(call.id, str(e), show_alert=True)
 
@@ -740,7 +910,21 @@ def approved_count() -> int:
 
 
 def remaining_slots() -> int:
+    """How many approved keys are still needed to reach TARGET_COUNT."""
     return max(TARGET_COUNT - approved_count(), 0)
+
+
+def remaining_ips_to_find(networks=None) -> tuple[int, int, int]:
+    """Return (approved, candidates, left_to_find).
+
+    TARGET_COUNT is the final number of working keys.
+    good_ips.txt contains candidates that have already been found but not yet checked.
+    Therefore finder should search only: TARGET_COUNT - approved - candidates.
+    """
+    approved = approved_count()
+    candidates = count_matching_good_ips(networks, exclude_approved=True)
+    left_to_find = max(TARGET_COUNT - approved - candidates, 0)
+    return approved, candidates, left_to_find
 
 
 def count_good_ips() -> int:
@@ -801,6 +985,21 @@ def get_connection(region):
     )
 
 
+def close_connection(conn):
+    if not conn:
+        return
+    try:
+        close = getattr(conn, "close", None)
+        if callable(close):
+            close()
+            return
+        session = getattr(conn, "session", None) or getattr(conn, "_session", None)
+        session_close = getattr(session, "close", None)
+        if callable(session_close):
+            session_close()
+    except Exception:
+        pass
+
 
 def region_env(name: str, region: str) -> str:
     suffix = region.upper().replace("-", "_")
@@ -840,14 +1039,18 @@ def get_floating_network(conn, region):
 
 def create_floating_ip(region):
     conn = get_connection(region)
-    network = get_floating_network(conn, region)
 
-    ip = conn.network.create_ip(floating_network_id=network.id)
+    try:
+        network = get_floating_network(conn, region)
+        ip = conn.network.create_ip(floating_network_id=network.id)
 
-    address = ip.floating_ip_address
-    ip_id = ip.id
+        address = ip.floating_ip_address
+        ip_id = ip.id
 
-    return conn, ip_id, address
+        return conn, ip_id, address
+    except Exception:
+        close_connection(conn)
+        raise
 
 
 def delete_floating_ip(conn, ip_id):
@@ -858,6 +1061,7 @@ def delete_floating_ip(conn, ip_id):
 
 
 def saved_ip_active(record: GoodIpRecord) -> bool:
+    conn = None
     try:
         conn = get_connection(record.region)
 
@@ -874,6 +1078,8 @@ def saved_ip_active(record: GoodIpRecord) -> bool:
     except Exception as e:
         print(f"⚠️ Не удалось проверить сохраненный IP {record.ip}: {e}", flush=True)
         return True
+    finally:
+        close_connection(conn)
 
 
 def sync_good_ips(networks=None, exclude_approved=False) -> int:
@@ -1032,7 +1238,6 @@ def get_candidate_flavors(conn, region):
 def get_provision_flavor(conn, region):
     return get_candidate_flavors(conn, region)[0]
 
-
 def get_provision_network(conn, region):
     network_id = provision_region_env("NETWORK_ID", region) or PROVISION_NETWORK_ID
     network_name = provision_region_env("NETWORK_NAME", region) or PROVISION_NETWORK_NAME
@@ -1070,7 +1275,6 @@ def get_explicit_provision_availability_zone(region):
     OpenStack/Selectel chooses a suitable zone itself.
     """
     return provision_region_env("AVAILABILITY_ZONE", region) or PROVISION_AVAILABILITY_ZONE
-
 
 def ensure_security_group(conn):
     security_group = conn.network.find_security_group(PROVISION_SECURITY_GROUP, ignore_missing=True)
@@ -1232,7 +1436,6 @@ def create_test_server(conn, record: GoodIpRecord):
         f"Последняя ошибка: {last_error}"
     )
 
-
 def cleanup_test_server(conn, server_id: str, ip: str):
     if not server_id:
         return
@@ -1313,6 +1516,8 @@ def run_single_vless_test(record: GoodIpRecord):
 
         if server and PROVISION_DELETE_SERVER_AFTER_RESULT:
             cleanup_test_server(conn, server.id, record.ip)
+
+        close_connection(conn)
 
 
 def provisioning_worker(records: list[GoodIpRecord]):
@@ -1429,14 +1634,16 @@ def finder_loop():
                     TELEGRAM_ALLOWED_CHAT_ID,
                     "🎯 Кандидаты для свободных слотов найдены\n"
                     f"✅ Принято ключей: {approved_count()}/{TARGET_COUNT}\n"
-                    f"📦 Новых кандидатов: {current_count}/{slots_left}",
+                    f"📦 Новых кандидатов: {current_count}/{slots_left}\n\n"
+                    "Finder остановлен. Серверы еще НЕ созданы.",
+                    reply_markup=create_servers_keyboard(),
                 )
-                start_provisioning_if_needed(whitelist)
                 time.sleep(5)
                 continue
 
             attempt += 1
             region = random.choice(regions)
+            update_finder_state(current_attempt=attempt, current_region=region, last_error="")
 
             print("=" * 70, flush=True)
             print(f"Попытка {attempt}", flush=True)
@@ -1450,6 +1657,7 @@ def finder_loop():
 
             try:
                 conn, ip_id, address = create_floating_ip(region)
+                update_finder_state(last_ip=address)
                 print(f"Получен IP: {address}", flush=True)
 
                 if is_banned_ip(address):
@@ -1477,11 +1685,16 @@ def finder_loop():
                     delete_floating_ip(conn, ip_id)
 
             except Exception as e:
+                update_finder_state(last_error=str(e))
                 print(f"⚠️ Ошибка создания IP в {region}:", flush=True)
                 print(e, flush=True)
 
                 if conn and ip_id:
                     delete_floating_ip(conn, ip_id)
+            finally:
+                close_connection(conn)
+                if attempt % 50 == 0:
+                    gc.collect()
 
             time.sleep(random.randint(5, 12))
 
