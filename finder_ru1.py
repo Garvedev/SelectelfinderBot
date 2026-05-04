@@ -10,6 +10,10 @@ import secrets
 import gc
 import io
 import subprocess
+import json
+import sqlite3
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -165,6 +169,15 @@ PROVISION_DECISION_TIMEOUT = int_env("PROVISION_DECISION_TIMEOUT", 300)
 PROVISION_DELETE_SERVER_AFTER_RESULT = bool_env("PROVISION_DELETE_SERVER_AFTER_RESULT", True)
 PROVISION_DELETE_FAILED_FLOATING_IP = bool_env("PROVISION_DELETE_FAILED_FLOATING_IP", True)
 
+TESTER_API_ENABLED = bool_env("TESTER_API_ENABLED", True)
+TESTER_API_HOST = optional_env("TESTER_API_HOST", "0.0.0.0")
+TESTER_API_PORT = int_env("TESTER_API_PORT", 8787)
+TESTER_TOKEN = optional_env("TESTER_TOKEN")
+TESTER_BATCH_SIZE = int_env("TESTER_BATCH_SIZE", 11)
+TESTER_LEASE_SECONDS = int_env("TESTER_LEASE_SECONDS", 900)
+TESTER_MAX_ATTEMPTS = int_env("TESTER_MAX_ATTEMPTS", 2)
+VLESS_QUEUE_DB = Path(optional_env("VLESS_QUEUE_DB", str(BASE_DIR / "vless_tests.sqlite3")))
+
 running = False
 last_good_ip_sync = 0.0
 settings_version = 0
@@ -174,6 +187,8 @@ waiting_for_whitelist_file = False
 provisioning_running = False
 provisioning_lock = threading.RLock()
 pending_vless_tests = {}
+vless_queue_lock = threading.RLock()
+tester_api_server = None
 finder_state_lock = threading.RLock()
 finder_state = {
     "current_attempt": 0,
@@ -318,6 +333,7 @@ def help_text() -> str:
         "/start — запустить поиск\n"
         "/stop — остановить поиск\n"
         "/status — статус, текущая попытка и настройки\n"
+        "/test_status — очередь авто-тестера VLESS\n"
         "/log — показать последние логи\n"
         "/create_servers — создать серверы и выдать ключи из найденных IP\n"
         "/upload — загрузить файл с IP/CIDR\n"
@@ -415,6 +431,8 @@ def cmd_status(message):
     with provisioning_lock:
         provision_state = "идет" if provisioning_running else "ожидает"
 
+    tester_stats = format_vless_queue_stats()
+
     bot.reply_to(
         message,
         f"📊 Статус: {state}\n"
@@ -429,8 +447,47 @@ def cmd_status(message):
         f"🎯 Целей в файле: {whitelist_status}\n"
         f"🌍 Регионы: {format_regions()}\n"
         f"🧪 Создание серверов: {provision_state}\n"
+        f"📲 Авто-тестер: {tester_stats}\n"
         f"🚫 Бан-лист: {len(load_banned_ips())}"
     )
+
+
+@bot.message_handler(commands=["test_status"])
+def cmd_test_status(message):
+    if not allowed(message):
+        bot.reply_to(message, "⛔ Access denied")
+        return
+
+    stats = get_vless_queue_stats()
+    recent = get_recent_vless_results(limit=8)
+    api_state = "включен" if TESTER_API_ENABLED and TESTER_TOKEN else "выключен/нет токена"
+
+    lines = [
+        "📲 Авто-тестер VLESS",
+        f"API: {api_state}",
+        f"Адрес: {TESTER_API_HOST}:{TESTER_API_PORT}",
+        f"batch: {TESTER_BATCH_SIZE}",
+        "",
+        "Очередь:",
+        f"queued: {stats.get('queued', 0)}",
+        f"testing: {stats.get('testing', 0)}",
+        f"approved: {stats.get('approved', 0)}",
+        f"rejected: {stats.get('rejected', 0)}",
+        f"error: {stats.get('error', 0)}",
+    ]
+
+    if recent:
+        lines.append("")
+        lines.append("Последние результаты:")
+        for item in recent:
+            status = item.get("status") or "-"
+            ip = item.get("ip") or "-"
+            worker = item.get("worker") or "-"
+            latency = item.get("latency_ms")
+            latency_text = f" {latency}ms" if latency is not None else ""
+            lines.append(f"{status} | {ip}{latency_text} | {worker}")
+
+    bot.reply_to(message, "\n".join(lines))
 
 
 @bot.message_handler(commands=["log"])
@@ -1127,6 +1184,368 @@ def matching_good_ip_records(networks=None, exclude_approved=False) -> list[Good
     return records
 
 
+
+# =========================
+# VLESS AUTO-TEST QUEUE / API
+# =========================
+
+FINAL_VLESS_STATUSES = {"approved", "rejected", "error"}
+ACTIVE_VLESS_STATUSES = {"queued", "testing"}
+
+
+def now_ts() -> int:
+    return int(time.time())
+
+
+def get_vless_queue_conn():
+    VLESS_QUEUE_DB.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(VLESS_QUEUE_DB, timeout=30)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_vless_queue():
+    with vless_queue_lock, get_vless_queue_conn() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS vless_tests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ip TEXT NOT NULL UNIQUE,
+                region TEXT NOT NULL,
+                ip_id TEXT,
+                server_id TEXT,
+                vless_key TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                worker TEXT,
+                exit_ip TEXT,
+                direct_ip TEXT,
+                latency_ms INTEGER,
+                error TEXT,
+                created_at INTEGER NOT NULL,
+                reserved_at INTEGER,
+                tested_at INTEGER
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_vless_tests_status ON vless_tests(status, created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_vless_tests_worker ON vless_tests(worker, reserved_at)")
+
+
+def enqueue_vless_test(record: GoodIpRecord, server_id: str, vless_key: str) -> int | None:
+    init_vless_queue()
+    with vless_queue_lock, get_vless_queue_conn() as conn:
+        try:
+            cur = conn.execute(
+                """
+                INSERT INTO vless_tests(ip, region, ip_id, server_id, vless_key, status, created_at)
+                VALUES (?, ?, ?, ?, ?, 'queued', ?)
+                """,
+                (record.ip, record.region, record.ip_id, server_id, vless_key, now_ts()),
+            )
+            return int(cur.lastrowid)
+        except sqlite3.IntegrityError:
+            row = conn.execute("SELECT id FROM vless_tests WHERE ip = ?", (record.ip,)).fetchone()
+            return int(row["id"]) if row else None
+
+
+def has_active_vless_test_ip(ip: str) -> bool:
+    init_vless_queue()
+    with vless_queue_lock, get_vless_queue_conn() as conn:
+        row = conn.execute(
+            "SELECT status FROM vless_tests WHERE ip = ?",
+            (ip,),
+        ).fetchone()
+        return bool(row and row["status"] in ACTIVE_VLESS_STATUSES)
+
+
+def get_vless_queue_stats() -> dict:
+    init_vless_queue()
+    with vless_queue_lock, get_vless_queue_conn() as conn:
+        rows = conn.execute(
+            "SELECT status, COUNT(*) AS cnt FROM vless_tests GROUP BY status"
+        ).fetchall()
+        stats = {row["status"]: int(row["cnt"]) for row in rows}
+    for status in ["queued", "testing", "approved", "rejected", "error"]:
+        stats.setdefault(status, 0)
+    return stats
+
+
+def format_vless_queue_stats() -> str:
+    stats = get_vless_queue_stats()
+    return (
+        f"queued={stats.get('queued', 0)}, "
+        f"testing={stats.get('testing', 0)}, "
+        f"approved={stats.get('approved', 0)}, "
+        f"rejected={stats.get('rejected', 0)}"
+    )
+
+
+def get_recent_vless_results(limit: int = 10) -> list[dict]:
+    init_vless_queue()
+    with vless_queue_lock, get_vless_queue_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, ip, region, status, worker, exit_ip, latency_ms, error, tested_at
+            FROM vless_tests
+            WHERE tested_at IS NOT NULL
+            ORDER BY tested_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def reserve_vless_tests(worker: str, limit: int) -> list[dict]:
+    init_vless_queue()
+    worker = (worker or "unknown-worker")[:80]
+    limit = max(1, min(int(limit or TESTER_BATCH_SIZE), TESTER_BATCH_SIZE))
+    now = now_ts()
+    stale_before = now - TESTER_LEASE_SECONDS
+
+    with vless_queue_lock, get_vless_queue_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            """
+            SELECT id
+            FROM vless_tests
+            WHERE attempts < ?
+              AND (
+                    status = 'queued'
+                    OR (status = 'testing' AND reserved_at IS NOT NULL AND reserved_at < ?)
+                  )
+            ORDER BY created_at ASC
+            LIMIT ?
+            """,
+            (TESTER_MAX_ATTEMPTS, stale_before, limit),
+        ).fetchall()
+        ids = [int(row["id"]) for row in rows]
+        if not ids:
+            conn.commit()
+            return []
+
+        placeholders = ",".join("?" for _ in ids)
+        conn.execute(
+            f"""
+            UPDATE vless_tests
+            SET status = 'testing',
+                attempts = attempts + 1,
+                worker = ?,
+                reserved_at = ?,
+                error = NULL
+            WHERE id IN ({placeholders})
+            """,
+            [worker, now, *ids],
+        )
+        tasks = conn.execute(
+            f"""
+            SELECT id, ip, region, server_id, vless_key, attempts
+            FROM vless_tests
+            WHERE id IN ({placeholders})
+            ORDER BY created_at ASC
+            """,
+            ids,
+        ).fetchall()
+        conn.commit()
+
+    return [
+        {
+            "id": int(row["id"]),
+            "ip": row["ip"],
+            "region": row["region"],
+            "server_id": row["server_id"],
+            "vless_url": row["vless_key"],
+            "attempts": int(row["attempts"]),
+        }
+        for row in tasks
+    ]
+
+
+def complete_vless_test_result(result: dict, worker: str = "") -> dict:
+    init_vless_queue()
+    test_id = int(result.get("id") or 0)
+    ok = bool(result.get("ok"))
+    exit_ip = (result.get("exit_ip") or "")[:80]
+    direct_ip = (result.get("direct_ip") or "")[:80]
+    error = (result.get("error") or "")[:1000]
+    latency_ms = result.get("latency_ms")
+    try:
+        latency_ms = int(latency_ms) if latency_ms is not None else None
+    except (TypeError, ValueError):
+        latency_ms = None
+
+    with vless_queue_lock, get_vless_queue_conn() as conn:
+        row = conn.execute("SELECT * FROM vless_tests WHERE id = ?", (test_id,)).fetchone()
+        if not row:
+            return {"id": test_id, "saved": False, "status": "unknown_id"}
+
+        old_status = row["status"]
+        if old_status in FINAL_VLESS_STATUSES:
+            return {"id": test_id, "saved": True, "status": old_status, "already_final": True}
+
+        record = GoodIpRecord(ip=row["ip"], region=row["region"], ip_id=row["ip_id"] or "")
+        server_id = row["server_id"] or ""
+        vless_key = row["vless_key"]
+        attempts = int(row["attempts"] or 0)
+        now = now_ts()
+
+        if ok:
+            conn.execute(
+                """
+                UPDATE vless_tests
+                SET status = 'approved', worker = COALESCE(?, worker), exit_ip = ?, direct_ip = ?,
+                    latency_ms = ?, error = NULL, tested_at = ?
+                WHERE id = ?
+                """,
+                (worker or None, exit_ip, direct_ip, latency_ms, now, test_id),
+            )
+            final_status = "approved"
+        elif attempts < TESTER_MAX_ATTEMPTS:
+            conn.execute(
+                """
+                UPDATE vless_tests
+                SET status = 'queued', worker = COALESCE(?, worker), exit_ip = ?, direct_ip = ?,
+                    latency_ms = ?, error = ?, tested_at = ?
+                WHERE id = ?
+                """,
+                (worker or None, exit_ip, direct_ip, latency_ms, error, now, test_id),
+            )
+            return {"id": test_id, "saved": True, "status": "retry_queued", "attempts": attempts}
+        else:
+            conn.execute(
+                """
+                UPDATE vless_tests
+                SET status = 'rejected', worker = COALESCE(?, worker), exit_ip = ?, direct_ip = ?,
+                    latency_ms = ?, error = ?, tested_at = ?
+                WHERE id = ?
+                """,
+                (worker or None, exit_ip, direct_ip, latency_ms, error, now, test_id),
+            )
+            final_status = "rejected"
+
+    # File/OpenStack side effects are intentionally outside the SQLite transaction.
+    conn = None
+    try:
+        if final_status == "approved":
+            save_approved_key(record, vless_key)
+            send(TELEGRAM_ALLOWED_CHAT_ID, f"✅ Авто-тестер принял IP: {record.ip} ({record.region}), {latency_ms or '-'} ms")
+        else:
+            ban_ip(record.ip, f"auto_vless_failed region={record.region} worker={worker or '-'}")
+            remove_good_ip(record.ip)
+            send(TELEGRAM_ALLOWED_CHAT_ID, f"🚫 Авто-тестер забанил IP: {record.ip} ({record.region}) — {error or 'fail'}")
+
+        conn = get_connection(record.region)
+        if final_status == "rejected" and PROVISION_DELETE_FAILED_FLOATING_IP:
+            delete_floating_ip_address(conn, record.ip, record.ip_id)
+        if server_id and PROVISION_DELETE_SERVER_AFTER_RESULT:
+            cleanup_test_server(conn, server_id, record.ip)
+    except Exception as e:
+        print(f"⚠️ Post-result cleanup failed for {record.ip}: {e}", flush=True)
+        send(TELEGRAM_ALLOWED_CHAT_ID, f"⚠️ Cleanup после авто-теста не удался для {record.ip}: {e}")
+    finally:
+        close_connection(conn)
+
+    return {"id": test_id, "saved": True, "status": final_status}
+
+
+class TesterAPIHandler(BaseHTTPRequestHandler):
+    server_version = "SelectelFinderTester/1.0"
+
+    def log_message(self, fmt, *args):
+        print(f"[tester-api] {self.address_string()} - {fmt % args}", flush=True)
+
+    def _send_json(self, status: int, payload: dict):
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _read_json(self) -> dict:
+        length = int(self.headers.get("Content-Length") or "0")
+        if length <= 0:
+            return {}
+        raw = self.rfile.read(length)
+        return json.loads(raw.decode("utf-8"))
+
+    def _authorized(self) -> bool:
+        if not TESTER_TOKEN:
+            return False
+        return self.headers.get("X-Tester-Token", "") == TESTER_TOKEN
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        if parsed.path == "/health":
+            self._send_json(200, {"ok": True, "stats": get_vless_queue_stats()})
+            return
+
+        if not self._authorized():
+            self._send_json(401, {"ok": False, "error": "unauthorized"})
+            return
+
+        if parsed.path == "/next_tests":
+            query = parse_qs(parsed.query)
+            worker = (query.get("worker") or ["unknown-worker"])[0]
+            limit_raw = (query.get("limit") or [str(TESTER_BATCH_SIZE)])[0]
+            try:
+                limit = int(limit_raw)
+            except ValueError:
+                limit = TESTER_BATCH_SIZE
+            tasks = reserve_vless_tests(worker=worker, limit=limit)
+            self._send_json(200, {"ok": True, "tasks": tasks})
+            return
+
+        self._send_json(404, {"ok": False, "error": "not_found"})
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        if not self._authorized():
+            self._send_json(401, {"ok": False, "error": "unauthorized"})
+            return
+
+        if parsed.path != "/results":
+            self._send_json(404, {"ok": False, "error": "not_found"})
+            return
+
+        try:
+            payload = self._read_json()
+            worker = (payload.get("worker") or "unknown-worker")[:80]
+            results = payload.get("results") or []
+            if not isinstance(results, list):
+                raise RuntimeError("results must be a list")
+            saved = [complete_vless_test_result(item, worker=worker) for item in results]
+            self._send_json(200, {"ok": True, "saved": saved, "stats": get_vless_queue_stats()})
+        except Exception as e:
+            print(f"[tester-api] POST /results error: {e}", flush=True)
+            self._send_json(400, {"ok": False, "error": str(e)})
+
+
+def start_tester_api_if_enabled():
+    global tester_api_server
+
+    init_vless_queue()
+
+    if not TESTER_API_ENABLED:
+        print("[tester-api] disabled: TESTER_API_ENABLED=false", flush=True)
+        return
+    if not TESTER_TOKEN:
+        print("[tester-api] disabled: TESTER_TOKEN is empty", flush=True)
+        send(TELEGRAM_ALLOWED_CHAT_ID, "⚠️ API авто-тестера выключен: TESTER_TOKEN пустой")
+        return
+
+    try:
+        tester_api_server = ThreadingHTTPServer((TESTER_API_HOST, TESTER_API_PORT), TesterAPIHandler)
+        thread = threading.Thread(target=tester_api_server.serve_forever, daemon=True)
+        thread.start()
+        print(f"[tester-api] listening on {TESTER_API_HOST}:{TESTER_API_PORT}", flush=True)
+        send(TELEGRAM_ALLOWED_CHAT_ID, f"📲 API авто-тестера запущен: {TESTER_API_HOST}:{TESTER_API_PORT}")
+    except Exception as e:
+        tester_api_server = None
+        print(f"[tester-api] failed to start: {e}", flush=True)
+        send(TELEGRAM_ALLOWED_CHAT_ID, f"⚠️ API авто-тестера не запустился: {e}")
+
 # =========================
 # PROVISIONING
 # =========================
@@ -1501,6 +1920,7 @@ def cleanup_test_server(conn, server_id: str, ip: str):
 
 
 def vless_keyboard(token: str):
+    """Legacy manual keyboard kept for compatibility with old callback messages."""
     keyboard = types.InlineKeyboardMarkup(row_width=2)
     keyboard.add(
         types.InlineKeyboardButton("✅ Работает", callback_data=f"vless:ok:{token}"),
@@ -1510,71 +1930,66 @@ def vless_keyboard(token: str):
 
 
 def run_single_vless_test(record: GoodIpRecord):
+    """Create the temporary server and enqueue its VLESS key for the phone worker.
+
+    The old implementation waited for Telegram buttons. The new flow stores the
+    task in SQLite and lets Redmi/Termux pick it up through /next_tests.
+    """
     conn = get_connection(record.region)
     server = None
-    token = secrets.token_urlsafe(8)
     vless_key = make_vless_key(record.ip)
 
     try:
-        server = create_test_server(conn, record)
-        pending = PendingVlessTest(
-            token=token,
-            record=record,
-            server_id=server.id,
-            vless_key=vless_key,
-        )
+        if has_active_vless_test_ip(record.ip):
+            print(f"ℹ️ IP уже находится в очереди авто-теста: {record.ip}", flush=True)
+            return
 
-        with provisioning_lock:
-            pending_vless_tests[token] = pending
+        server = create_test_server(conn, record)
+        task_id = enqueue_vless_test(record, server.id, vless_key)
 
         send(
             TELEGRAM_ALLOWED_CHAT_ID,
-            "🧪 Проверь ключ\n"
+            "📲 VLESS поставлен в очередь авто-тестера\n"
+            f"ID: {task_id}\n"
             f"IP: {record.ip}\n"
-            f"Регион: {record.region}\n\n"
-            f"{vless_key}",
-            reply_markup=vless_keyboard(token),
+            f"Регион: {record.region}\n"
+            f"Очередь: {format_vless_queue_stats()}",
         )
 
-        if not pending.event.wait(PROVISION_DECISION_TIMEOUT):
-            send(TELEGRAM_ALLOWED_CHAT_ID, f"⏱ Нет ответа по {record.ip}, временный сервер будет удален")
-            return
-
-        if pending.result == "ok":
-            save_approved_key(record, vless_key)
-            send(TELEGRAM_ALLOWED_CHAT_ID, f"✅ IP принят: {record.ip}")
-        elif pending.result == "bad":
-            ban_ip(record.ip, f"failed_vless_test region={record.region}")
-            remove_good_ip(record.ip)
-            if PROVISION_DELETE_FAILED_FLOATING_IP:
-                delete_floating_ip_address(conn, record.ip, record.ip_id)
-            send(TELEGRAM_ALLOWED_CHAT_ID, f"🚫 IP забанен: {record.ip}")
-
     except Exception as e:
-        send(TELEGRAM_ALLOWED_CHAT_ID, f"⚠️ Ошибка проверки {record.ip} ({record.region}): {e}")
-        print(f"⚠️ Provisioning error for {record.ip}: {e}", flush=True)
-    finally:
-        with provisioning_lock:
-            pending_vless_tests.pop(token, None)
-
+        send(TELEGRAM_ALLOWED_CHAT_ID, f"⚠️ Ошибка постановки {record.ip} ({record.region}) в авто-тест: {e}")
+        print(f"⚠️ Provisioning/enqueue error for {record.ip}: {e}", flush=True)
         if server and PROVISION_DELETE_SERVER_AFTER_RESULT:
-            cleanup_test_server(conn, server.id, record.ip)
-
+            try:
+                cleanup_test_server(conn, server.id, record.ip)
+            except Exception as cleanup_error:
+                print(f"⚠️ Cleanup after enqueue error failed for {record.ip}: {cleanup_error}", flush=True)
+    finally:
         close_connection(conn)
 
 
 def provisioning_worker(records: list[GoodIpRecord]):
     global provisioning_running
 
+    queued = 0
     try:
-        send(TELEGRAM_ALLOWED_CHAT_ID, f"🧪 Запускаю проверку VLESS для {len(records)} IP")
+        send(TELEGRAM_ALLOWED_CHAT_ID, f"🧪 Создаю серверы и ставлю в очередь авто-тестера: {len(records)} IP")
 
         for record in records:
             if is_banned_ip(record.ip):
                 continue
+            before = get_vless_queue_stats().get("queued", 0) + get_vless_queue_stats().get("testing", 0)
             run_single_vless_test(record)
+            after = get_vless_queue_stats().get("queued", 0) + get_vless_queue_stats().get("testing", 0)
+            if after >= before:
+                queued += 1
 
-        send(TELEGRAM_ALLOWED_CHAT_ID, "✅ Проверка VLESS завершена")
+        send(
+            TELEGRAM_ALLOWED_CHAT_ID,
+            "✅ Создание серверов завершено\n"
+            f"📲 Поставлено/уже было в очереди: {queued}\n"
+            f"Очередь: {format_vless_queue_stats()}",
+        )
     finally:
         with provisioning_lock:
             provisioning_running = False
@@ -1598,9 +2013,13 @@ def start_provisioning_if_needed(networks=None):
         send(TELEGRAM_ALLOWED_CHAT_ID, f"✅ Уже есть {approved_count()}/{TARGET_COUNT} рабочих ключей")
         return
 
-    records = matching_good_ip_records(networks, exclude_approved=True)[:slots_left]
+    records = [
+        record
+        for record in matching_good_ip_records(networks, exclude_approved=True)
+        if not has_active_vless_test_ip(record.ip)
+    ][:slots_left]
     if not records:
-        send(TELEGRAM_ALLOWED_CHAT_ID, "⚠️ Нет подходящих IP для VLESS-проверки")
+        send(TELEGRAM_ALLOWED_CHAT_ID, "⚠️ Нет подходящих IP для VLESS-проверки или все уже в очереди авто-тестера")
         return
 
     with provisioning_lock:
@@ -1752,6 +2171,7 @@ def finder_loop():
 
 if __name__ == "__main__":
     print("🤖 Telegram бот запущен", flush=True)
+    start_tester_api_if_enabled()
 
     thread = threading.Thread(target=finder_loop, daemon=True)
     thread.start()

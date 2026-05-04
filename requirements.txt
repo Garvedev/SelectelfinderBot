@@ -3,3 +3,4 @@ openstacksdk
 pyTelegramBotAPI
 requests[socks]
 python-dotenv
+aiohttp
