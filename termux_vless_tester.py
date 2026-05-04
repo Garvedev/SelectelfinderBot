@@ -16,6 +16,7 @@ import signal
 import subprocess
 import time
 from pathlib import Path
+from collections import deque
 from urllib.parse import parse_qs, unquote, urlparse
 
 API_BASE = os.getenv("TESTER_API_BASE", "http://YOUR_VPS_IP:8787").rstrip("/")
@@ -36,10 +37,16 @@ SINGBOX_STARTUP_WAIT = float(os.getenv("SINGBOX_STARTUP_WAIT", "2.5"))
 CURL_TIMEOUT = int(os.getenv("CURL_TIMEOUT", "20"))
 TEST_URL = os.getenv("TEST_URL", "https://api.ipify.org")
 DIRECT_TEST_URL = os.getenv("DIRECT_TEST_URL", TEST_URL)
+HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "30"))
+AGENT_VERSION = "dashboard-1"
+
+LOG_BUFFER: deque[str] = deque(maxlen=80)
 
 
 def log(message: str):
-    print(time.strftime("%Y-%m-%d %H:%M:%S"), message, flush=True)
+    line = time.strftime("%Y-%m-%d %H:%M:%S") + " " + message
+    LOG_BUFFER.append(line)
+    print(line, flush=True)
 
 
 def first(params: dict[str, list[str]], name: str, default: str | None = None):
@@ -241,6 +248,25 @@ def api_post(path: str, payload: dict) -> dict:
     return json.loads(out)
 
 
+def log_tail() -> str:
+    return "\n".join(LOG_BUFFER)
+
+
+def send_heartbeat(control_ok: bool = True, current_task: str = "", last_error: str = ""):
+    payload = {
+        "worker": WORKER_ID,
+        "control_ok": control_ok,
+        "api_ok": True,
+        "current_task": current_task,
+        "last_error": last_error,
+        "network": "unknown",
+        "battery": "",
+        "version": AGENT_VERSION,
+        "log_tail": log_tail(),
+    }
+    api_post("/worker_heartbeat", payload)
+
+
 def direct_ip() -> tuple[bool, str | None]:
     try:
         code, out = curl_text(DIRECT_TEST_URL, proxy_port=None, timeout=8)
@@ -362,11 +388,21 @@ def main():
 
     WORK_DIR.mkdir(parents=True, exist_ok=True)
     control_proc = None
+    last_heartbeat = 0.0
     log(f"worker started: {WORKER_ID}, api={API_BASE}")
 
     while True:
         try:
             control_proc = ensure_control(control_proc)
+
+            now = time.time()
+            if now - last_heartbeat >= HEARTBEAT_INTERVAL:
+                try:
+                    send_heartbeat(control_ok=True)
+                    last_heartbeat = now
+                except Exception as e:
+                    log("heartbeat failed: " + repr(e))
+
             flush_pending_results()
 
             data = api_get(f"/next_tests?worker={WORKER_ID}&limit={BATCH_SIZE}")
@@ -377,12 +413,18 @@ def main():
 
             log(f"received tasks: {len(tasks)}")
             for task in tasks:
+                current_task = f"id={task.get('id')} ip={task.get('ip')}"
+                try:
+                    send_heartbeat(control_ok=True, current_task=current_task)
+                except Exception:
+                    pass
                 log(f"testing id={task.get('id')} ip={task.get('ip')} region={task.get('region')}")
                 result = test_vless(task)
                 append_pending_result(result)
                 log(f"result id={result.get('id')} ok={result.get('ok')} exit_ip={result.get('exit_ip')} error={result.get('error')}")
                 try:
                     flush_pending_results()
+                    send_heartbeat(control_ok=True, current_task="", last_error=str(result.get("error") or ""))
                 except Exception as e:
                     log("cannot send result now: " + repr(e))
 
@@ -390,7 +432,12 @@ def main():
             log("stopped")
             break
         except Exception as e:
-            log("loop error: " + repr(e))
+            err = repr(e)
+            log("loop error: " + err)
+            try:
+                send_heartbeat(control_ok=False, last_error=err)
+            except Exception:
+                pass
             stop_process(control_proc)
             control_proc = None
             time.sleep(POLL_SLEEP)

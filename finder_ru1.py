@@ -12,6 +12,8 @@ import io
 import subprocess
 import json
 import sqlite3
+import html
+import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 from dataclasses import dataclass, field
@@ -176,7 +178,13 @@ TESTER_TOKEN = optional_env("TESTER_TOKEN")
 TESTER_BATCH_SIZE = int_env("TESTER_BATCH_SIZE", 11)
 TESTER_LEASE_SECONDS = int_env("TESTER_LEASE_SECONDS", 900)
 TESTER_MAX_ATTEMPTS = int_env("TESTER_MAX_ATTEMPTS", 2)
-VLESS_QUEUE_DB = Path(optional_env("VLESS_QUEUE_DB", str(BASE_DIR / "vless_tests.sqlite3")))
+_vless_queue_db_raw = optional_env("VLESS_QUEUE_DB")
+VLESS_QUEUE_DB = Path(_vless_queue_db_raw or str(BASE_DIR / "vless_tests.sqlite3"))
+
+DASHBOARD_ENABLED = bool_env("DASHBOARD_ENABLED", True)
+DASHBOARD_USERNAME = optional_env("DASHBOARD_USERNAME", "admin")
+DASHBOARD_PASSWORD = optional_env("DASHBOARD_PASSWORD")
+DASHBOARD_LOG_LINES = int_env("DASHBOARD_LOG_LINES", 200)
 
 running = False
 last_good_ip_sync = 0.0
@@ -1230,6 +1238,22 @@ def init_vless_queue():
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_vless_tests_status ON vless_tests(status, created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_vless_tests_worker ON vless_tests(worker, reserved_at)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS vless_workers (
+                worker TEXT PRIMARY KEY,
+                updated_at INTEGER NOT NULL,
+                control_ok INTEGER NOT NULL DEFAULT 0,
+                api_ok INTEGER NOT NULL DEFAULT 0,
+                current_task TEXT,
+                last_error TEXT,
+                network TEXT,
+                battery TEXT,
+                version TEXT,
+                log_tail TEXT
+            )
+            """
+        )
 
 
 def enqueue_vless_test(record: GoodIpRecord, server_id: str, vless_key: str) -> int | None:
@@ -1449,6 +1473,226 @@ def complete_vless_test_result(result: dict, worker: str = "") -> dict:
     return {"id": test_id, "saved": True, "status": final_status}
 
 
+
+def save_worker_heartbeat(payload: dict, worker: str = "") -> dict:
+    init_vless_queue()
+    worker = (worker or payload.get("worker") or "unknown-worker")[:80]
+    now = now_ts()
+
+    def cut(name: str, limit: int = 1000) -> str:
+        return str(payload.get(name) or "")[:limit]
+
+    control_ok = 1 if payload.get("control_ok") else 0
+    api_ok = 1 if payload.get("api_ok", True) else 0
+    current_task = cut("current_task", 200)
+    last_error = cut("last_error", 1000)
+    network = cut("network", 120)
+    battery = cut("battery", 80)
+    version = cut("version", 80)
+    log_tail = cut("log_tail", 12000)
+
+    with vless_queue_lock, get_vless_queue_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO vless_workers(worker, updated_at, control_ok, api_ok, current_task, last_error, network, battery, version, log_tail)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(worker) DO UPDATE SET
+                updated_at = excluded.updated_at,
+                control_ok = excluded.control_ok,
+                api_ok = excluded.api_ok,
+                current_task = excluded.current_task,
+                last_error = excluded.last_error,
+                network = excluded.network,
+                battery = excluded.battery,
+                version = excluded.version,
+                log_tail = excluded.log_tail
+            """,
+            (worker, now, control_ok, api_ok, current_task, last_error, network, battery, version, log_tail),
+        )
+    return {"worker": worker, "saved": True, "updated_at": now}
+
+
+def get_worker_statuses() -> list[dict]:
+    init_vless_queue()
+    now = now_ts()
+    with vless_queue_lock, get_vless_queue_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT worker, updated_at, control_ok, api_ok, current_task, last_error, network, battery, version, log_tail
+            FROM vless_workers
+            ORDER BY updated_at DESC
+            """
+        ).fetchall()
+    workers = []
+    for row in rows:
+        item = dict(row)
+        item["control_ok"] = bool(item.get("control_ok"))
+        item["api_ok"] = bool(item.get("api_ok"))
+        item["age_seconds"] = max(0, now - int(item.get("updated_at") or 0))
+        item["online"] = item["age_seconds"] <= 90
+        workers.append(item)
+    return workers
+
+
+def get_recent_vless_tests(limit: int = 50) -> list[dict]:
+    init_vless_queue()
+    limit = max(1, min(int(limit or 50), 200))
+    with vless_queue_lock, get_vless_queue_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, ip, region, status, attempts, worker, exit_ip, direct_ip, latency_ms, error, created_at, reserved_at, tested_at
+            FROM vless_tests
+            ORDER BY COALESCE(tested_at, reserved_at, created_at) DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def tail_file_text(path: Path, lines: int = 200, max_bytes: int = 200_000) -> str:
+    try:
+        if not path.exists():
+            return ""
+        data = path.read_bytes()[-max_bytes:]
+        text = data.decode("utf-8", errors="replace")
+        return "\n".join(text.splitlines()[-lines:])
+    except Exception as e:
+        return f"Не удалось прочитать {path}: {e}"
+
+
+def ts_to_text(value) -> str:
+    try:
+        value = int(value or 0)
+    except Exception:
+        value = 0
+    if not value:
+        return "-"
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(value))
+
+
+def dashboard_snapshot() -> dict:
+    fs = get_finder_state()
+    with provisioning_lock:
+        provision_state = "running" if provisioning_running else "idle"
+    try:
+        if WHITELIST_FILE.exists():
+            networks, _invalid = parse_whitelist_text(WHITELIST_FILE.read_text(encoding="utf-8-sig", errors="ignore"))
+            whitelist_count = len(networks)
+        else:
+            whitelist_count = None
+    except Exception:
+        whitelist_count = None
+
+    return {
+        "ok": True,
+        "generated_at": now_ts(),
+        "finder": {
+            "running": running,
+            "current_attempt": fs.get("current_attempt") or 0,
+            "current_region": fs.get("current_region") or "",
+            "last_ip": fs.get("last_ip") or "",
+            "last_error": fs.get("last_error") or "",
+            "started_at": fs.get("started_at") or "",
+            "selected_regions": get_selected_regions(),
+        },
+        "provisioning": {"state": provision_state},
+        "counts": {
+            "target": TARGET_COUNT,
+            "approved": approved_count(),
+            "candidates": count_good_ips(),
+            "banned": len(load_banned_ips()),
+            "whitelist": whitelist_count,
+        },
+        "queue": get_vless_queue_stats(),
+        "workers": get_worker_statuses(),
+        "tests": get_recent_vless_tests(limit=50),
+        "logs": {
+            "finder": tail_file_text(LOG_FILE, DASHBOARD_LOG_LINES),
+        },
+    }
+
+
+def dashboard_html() -> str:
+    return """<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Selectel Finder Dashboard</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0b1020; --card:#121a2d; --muted:#91a0bd; --line:#26324f; --good:#34d399; --bad:#fb7185; --warn:#fbbf24; --text:#e5edff; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: system-ui, -apple-system, Segoe UI, sans-serif; background:var(--bg); color:var(--text); }
+    header { position:sticky; top:0; z-index:10; background:rgba(11,16,32,.92); border-bottom:1px solid var(--line); padding:14px 18px; backdrop-filter: blur(8px); }
+    h1 { margin:0; font-size:20px; }
+    main { padding:18px; max-width:1400px; margin:0 auto; }
+    .grid { display:grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap:14px; }
+    .card { background:var(--card); border:1px solid var(--line); border-radius:16px; padding:14px; box-shadow: 0 10px 30px rgba(0,0,0,.18); }
+    .card h2 { margin:0 0 10px; font-size:15px; color:#c8d6f7; }
+    .num { font-size:28px; font-weight:800; }
+    .muted { color:var(--muted); font-size:13px; }
+    .ok { color:var(--good); } .bad { color:var(--bad); } .warn { color:var(--warn); }
+    table { width:100%; border-collapse: collapse; font-size:13px; }
+    th,td { text-align:left; border-bottom:1px solid var(--line); padding:8px 7px; vertical-align:top; }
+    th { color:#b8c6e6; font-weight:700; }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    pre { white-space:pre-wrap; word-break:break-word; max-height:380px; overflow:auto; background:#080d19; border:1px solid var(--line); border-radius:12px; padding:12px; font-size:12px; }
+    .span4 { grid-column: span 4; }
+    .span2 { grid-column: span 2; }
+    .badge { display:inline-block; border-radius:999px; padding:2px 8px; background:#1e2a46; border:1px solid var(--line); font-size:12px; }
+    .row { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+    button { background:#2563eb; color:white; border:0; border-radius:10px; padding:9px 12px; font-weight:700; cursor:pointer; }
+    button:hover { background:#1d4ed8; }
+    @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } .span4,.span2 { grid-column: span 1; } table { font-size:12px; } }
+  </style>
+</head>
+<body>
+<header><div class="row"><h1>🚀 Selectel Finder Dashboard</h1><button onclick="load()">Обновить</button></div><div class="muted" id="updated">загрузка...</div></header>
+<main>
+  <div class="grid">
+    <div class="card"><h2>Finder</h2><div class="num" id="finderState">-</div><div class="muted" id="finderMeta"></div></div>
+    <div class="card"><h2>Approved</h2><div class="num ok" id="approved">0</div><div class="muted" id="target"></div></div>
+    <div class="card"><h2>Queue</h2><div class="num" id="queueTotal">0</div><div class="muted" id="queueMeta"></div></div>
+    <div class="card"><h2>Workers</h2><div class="num" id="workersTotal">0</div><div class="muted" id="workersMeta"></div></div>
+    <div class="card span2"><h2>Телефон / workers</h2><div id="workers"></div></div>
+    <div class="card span2"><h2>Состояние</h2><div id="state"></div></div>
+    <div class="card span4"><h2>Последние тесты</h2><div style="overflow:auto"><table id="tests"><thead><tr><th>ID</th><th>IP</th><th>Регион</th><th>Статус</th><th>Поп.</th><th>Worker</th><th>Exit IP</th><th>ms</th><th>Ошибка</th></tr></thead><tbody></tbody></table></div></div>
+    <div class="card span2"><h2>Лог телефона</h2><pre id="phoneLog"></pre></div>
+    <div class="card span2"><h2>Лог VPS</h2><pre id="finderLog"></pre></div>
+  </div>
+</main>
+<script>
+function esc(s){return String(s ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));}
+function age(s){ if(s == null) return '-'; if(s < 60) return s+' сек'; if(s < 3600) return Math.round(s/60)+' мин'; return Math.round(s/3600)+' ч'; }
+async function load(){
+  const r = await fetch('/dashboard/api/status', {cache:'no-store'});
+  if(!r.ok){ document.getElementById('updated').textContent='ошибка загрузки: '+r.status; return; }
+  const d = await r.json();
+  document.getElementById('updated').textContent = 'обновлено: ' + new Date(d.generated_at*1000).toLocaleString();
+  document.getElementById('finderState').innerHTML = d.finder.running ? '<span class="ok">работает</span>' : '<span class="warn">стоп</span>';
+  document.getElementById('finderMeta').textContent = 'регион: ' + (d.finder.current_region || '-') + ', попытка: ' + d.finder.current_attempt;
+  document.getElementById('approved').textContent = d.counts.approved;
+  document.getElementById('target').textContent = 'цель: ' + d.counts.target + ', кандидаты: ' + d.counts.candidates + ', ban: ' + d.counts.banned;
+  const q = d.queue || {}; const total = (q.queued||0)+(q.testing||0);
+  document.getElementById('queueTotal').textContent = total;
+  document.getElementById('queueMeta').textContent = `queued=${q.queued||0}, testing=${q.testing||0}, approved=${q.approved||0}, rejected=${q.rejected||0}, error=${q.error||0}`;
+  document.getElementById('workersTotal').textContent = (d.workers||[]).length;
+  document.getElementById('workersMeta').textContent = (d.workers||[]).filter(w=>w.online).length + ' online';
+  document.getElementById('state').innerHTML = `<p>Provisioning: <b>${esc(d.provisioning.state)}</b></p><p>Последний IP: <code>${esc(d.finder.last_ip || '-')}</code></p><p>Последняя ошибка: <span class="bad">${esc(d.finder.last_error || '-')}</span></p><p>Регионы: ${esc((d.finder.selected_regions||[]).join(', '))}</p>`;
+  const workers = d.workers || [];
+  document.getElementById('workers').innerHTML = workers.length ? workers.map(w => `<div style="margin-bottom:10px"><span class="badge ${w.online?'ok':'bad'}">${w.online?'online':'offline'}</span> <b>${esc(w.worker)}</b><br><span class="muted">last seen: ${age(w.age_seconds)}, control=${w.control_ok?'OK':'NO'}, api=${w.api_ok?'OK':'NO'}, task=${esc(w.current_task||'-')}</span><br><span class="bad">${esc(w.last_error||'')}</span></div>`).join('') : '<span class="muted">нет heartbeat от телефона</span>';
+  const lastWorker = workers[0];
+  document.getElementById('phoneLog').textContent = lastWorker && lastWorker.log_tail ? lastWorker.log_tail : 'Пока нет логов телефона. Обнови termux_vless_tester.py до dashboard-версии.';
+  document.getElementById('finderLog').textContent = d.logs.finder || 'лог пуст';
+  const tbody = document.querySelector('#tests tbody');
+  tbody.innerHTML = (d.tests||[]).map(t => `<tr><td>${t.id}</td><td><code>${esc(t.ip)}</code></td><td>${esc(t.region)}</td><td><span class="badge">${esc(t.status)}</span></td><td>${t.attempts||0}</td><td>${esc(t.worker||'-')}</td><td>${esc(t.exit_ip||'-')}</td><td>${esc(t.latency_ms||'-')}</td><td class="bad">${esc(t.error||'')}</td></tr>`).join('');
+}
+load(); setInterval(load, 10000);
+</script>
+</body>
+</html>"""
+
 class TesterAPIHandler(BaseHTTPRequestHandler):
     server_version = "SelectelFinderTester/1.0"
 
@@ -1463,6 +1707,21 @@ class TesterAPIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _send_text(self, status: int, text: str, content_type: str = "text/plain; charset=utf-8"):
+        data = text.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _send_dashboard_login(self):
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="Selectel Finder Dashboard"')
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write("Dashboard login required".encode("utf-8"))
+
     def _read_json(self) -> dict:
         length = int(self.headers.get("Content-Length") or "0")
         if length <= 0:
@@ -1473,12 +1732,55 @@ class TesterAPIHandler(BaseHTTPRequestHandler):
     def _authorized(self) -> bool:
         if not TESTER_TOKEN:
             return False
-        return self.headers.get("X-Tester-Token", "") == TESTER_TOKEN
+        return hmac.compare_digest(self.headers.get("X-Tester-Token", ""), TESTER_TOKEN)
+
+    def _dashboard_authorized(self) -> bool:
+        if not DASHBOARD_ENABLED or not DASHBOARD_PASSWORD:
+            return False
+        auth = self.headers.get("Authorization", "")
+        if not auth.startswith("Basic "):
+            return False
+        try:
+            decoded = base64.b64decode(auth.split(" ", 1)[1]).decode("utf-8")
+            username, password = decoded.split(":", 1)
+        except Exception:
+            return False
+        return hmac.compare_digest(username, DASHBOARD_USERNAME) and hmac.compare_digest(password, DASHBOARD_PASSWORD)
+
+    def _require_dashboard_auth(self) -> bool:
+        if not DASHBOARD_ENABLED:
+            self._send_text(404, "dashboard disabled")
+            return False
+        if not DASHBOARD_PASSWORD:
+            self._send_text(503, "DASHBOARD_PASSWORD is empty")
+            return False
+        if not self._dashboard_authorized():
+            self._send_dashboard_login()
+            return False
+        return True
 
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/health":
             self._send_json(200, {"ok": True, "stats": get_vless_queue_stats()})
+            return
+
+        if parsed.path == "/dashboard":
+            if not self._require_dashboard_auth():
+                return
+            self._send_text(200, dashboard_html(), "text/html; charset=utf-8")
+            return
+
+        if parsed.path == "/dashboard/api/status":
+            if not self._require_dashboard_auth():
+                return
+            self._send_json(200, dashboard_snapshot())
+            return
+
+        if parsed.path == "/dashboard/api/logs":
+            if not self._require_dashboard_auth():
+                return
+            self._send_json(200, {"ok": True, "finder_log": tail_file_text(LOG_FILE, DASHBOARD_LOG_LINES), "workers": get_worker_statuses()})
             return
 
         if not self._authorized():
@@ -1505,6 +1807,17 @@ class TesterAPIHandler(BaseHTTPRequestHandler):
             self._send_json(401, {"ok": False, "error": "unauthorized"})
             return
 
+        if parsed.path == "/worker_heartbeat":
+            try:
+                payload = self._read_json()
+                worker = (payload.get("worker") or "unknown-worker")[:80]
+                saved = save_worker_heartbeat(payload, worker=worker)
+                self._send_json(200, {"ok": True, "saved": saved})
+            except Exception as e:
+                print(f"[tester-api] POST /worker_heartbeat error: {e}", flush=True)
+                self._send_json(400, {"ok": False, "error": str(e)})
+            return
+
         if parsed.path != "/results":
             self._send_json(404, {"ok": False, "error": "not_found"})
             return
@@ -1516,6 +1829,7 @@ class TesterAPIHandler(BaseHTTPRequestHandler):
             if not isinstance(results, list):
                 raise RuntimeError("results must be a list")
             saved = [complete_vless_test_result(item, worker=worker) for item in results]
+            save_worker_heartbeat({"worker": worker, "api_ok": True, "control_ok": True, "current_task": "", "last_error": "", "log_tail": ""}, worker=worker)
             self._send_json(200, {"ok": True, "saved": saved, "stats": get_vless_queue_stats()})
         except Exception as e:
             print(f"[tester-api] POST /results error: {e}", flush=True)
@@ -1540,6 +1854,8 @@ def start_tester_api_if_enabled():
         thread = threading.Thread(target=tester_api_server.serve_forever, daemon=True)
         thread.start()
         print(f"[tester-api] listening on {TESTER_API_HOST}:{TESTER_API_PORT}", flush=True)
+        if DASHBOARD_ENABLED:
+            print(f"[dashboard] enabled on /dashboard user={DASHBOARD_USERNAME}", flush=True)
         send(TELEGRAM_ALLOWED_CHAT_ID, f"📲 API авто-тестера запущен: {TESTER_API_HOST}:{TESTER_API_PORT}")
     except Exception as e:
         tester_api_server = None

@@ -117,3 +117,35 @@ curl через test proxy вернул внешний IP, совпадающи�
 ```
 
 `/test_status` показывает очередь, последние результаты и состояние API.
+
+## Web dashboard
+
+Dashboard is served by the same tester API process.
+
+```env
+DASHBOARD_ENABLED=true
+DASHBOARD_USERNAME=admin
+DASHBOARD_PASSWORD=CHANGE_ME_LONG_PASSWORD
+DASHBOARD_LOG_LINES=200
+VLESS_QUEUE_DB=/opt/selectel-finder/vless_tests.sqlite3
+```
+
+Open in browser:
+
+```text
+http://YOUR_VPS_IP:8787/dashboard
+```
+
+The browser will ask for login and password using HTTP Basic Auth.
+
+The dashboard shows:
+
+- finder status;
+- approved/candidate/ban counters;
+- VLESS queue counters;
+- latest tests;
+- VPS log tail;
+- Termux worker online/offline status;
+- last Termux worker log tail from heartbeat.
+
+Update `termux_vless_tester.py` on the phone too, because the dashboard receives phone status through `/worker_heartbeat`.
