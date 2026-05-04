@@ -496,6 +496,9 @@ def cmd_test_status(message):
         f"testing: {stats.get('testing', 0)}",
         f"provisioning: {stats.get('provisioning', 0)}",
         f"approved: {stats.get('approved', 0)}",
+        f"phone_tcp_unreachable: {stats.get('phone_tcp_unreachable', 0)}",
+        f"vless_failed: {stats.get('vless_failed', 0)}",
+        f"exit_ip_mismatch: {stats.get('exit_ip_mismatch', 0)}",
         f"phone_failed: {stats.get('phone_failed', 0)}",
         f"provision_failed: {stats.get('provision_failed', 0)}",
         f"manual_banned: {stats.get('manual_banned', 0)}",
@@ -1251,9 +1254,10 @@ def matching_good_ip_records(networks=None, exclude_approved=False) -> list[Good
 # VLESS AUTO-TEST QUEUE / API
 # =========================
 
-FINAL_VLESS_STATUSES = {"approved", "phone_failed", "provision_failed", "manual_banned", "deleted", "rejected", "error"}
+PHONE_FAILURE_STATUSES = {"phone_tcp_unreachable", "vless_failed", "exit_ip_mismatch", "phone_failed"}
+FINAL_VLESS_STATUSES = {"approved", "provision_failed", "manual_banned", "deleted", "rejected", "error", *PHONE_FAILURE_STATUSES}
 ACTIVE_VLESS_STATUSES = {"queued", "testing", "provisioning"}
-REVIEW_VLESS_STATUSES = {"phone_failed", "provision_failed", "error", "rejected"}
+REVIEW_VLESS_STATUSES = {"provision_failed", "error", "rejected", *PHONE_FAILURE_STATUSES}
 CONTROL_DEFAULTS = {
     "testing_paused": "0",
     "provisioning_paused": "0",
@@ -1375,6 +1379,29 @@ def get_tester_control_state() -> dict:
         "testing_paused": is_testing_paused(),
         "provisioning_paused": is_provisioning_paused(),
     }
+
+
+
+def classify_phone_failure(error: str) -> str:
+    """Map worker error strings into actionable review statuses."""
+    e = (error or "").strip().lower()
+    if e.startswith("phone_tcp_unreachable") or "phone_tcp_unreachable" in e:
+        return "phone_tcp_unreachable"
+    if e.startswith("exit_ip_mismatch") or "exit_ip_mismatch" in e:
+        return "exit_ip_mismatch"
+    if e.startswith("vless_failed") or "curl_through_test_proxy_failed" in e or "cannot complete socks5" in e:
+        return "vless_failed"
+    return "phone_failed"
+
+
+def phone_failure_human_hint(status: str) -> str:
+    if status == "phone_tcp_unreachable":
+        return "телефон не смог напрямую открыть TCP к candidate IP:443; IP не подходит как белый входной IP для этой сети"
+    if status == "vless_failed":
+        return "TCP до candidate IP есть, но VLESS/REALITY/curl через test proxy не сработал"
+    if status == "exit_ip_mismatch":
+        return "VLESS отвечает, но exit IP не совпал с выбранной политикой проверки"
+    return "телефонная проверка не прошла"
 
 
 def pause_all_testing():
@@ -1508,7 +1535,7 @@ def start_manual_retry(test_id: int) -> dict:
     if status not in REVIEW_VLESS_STATUSES:
         raise RuntimeError(f"retry is allowed only for failed/review statuses, current status={status}")
 
-    if status == "phone_failed" and row.get("server_id") and row.get("vless_key"):
+    if status in PHONE_FAILURE_STATUSES and row.get("server_id") and row.get("vless_key"):
         return reset_vless_test_to_queued(test_id)
 
     if is_provisioning_paused():
@@ -1580,7 +1607,7 @@ def get_vless_queue_stats() -> dict:
             "SELECT status, COUNT(*) AS cnt FROM vless_tests GROUP BY status"
         ).fetchall()
         stats = {row["status"]: int(row["cnt"]) for row in rows}
-    for status in ["queued", "testing", "provisioning", "approved", "phone_failed", "provision_failed", "manual_banned", "rejected", "error"]:
+    for status in ["queued", "testing", "provisioning", "approved", "phone_tcp_unreachable", "vless_failed", "exit_ip_mismatch", "phone_failed", "provision_failed", "manual_banned", "rejected", "error"]:
         stats.setdefault(status, 0)
     return stats
 
@@ -1591,7 +1618,9 @@ def format_vless_queue_stats() -> str:
         f"queued={stats.get('queued', 0)}, "
         f"testing={stats.get('testing', 0)}, "
         f"approved={stats.get('approved', 0)}, "
-        f"phone_failed={stats.get('phone_failed', 0)}, "
+        f"tcp_unreachable={stats.get('phone_tcp_unreachable', 0)}, "
+        f"vless_failed={stats.get('vless_failed', 0)}, "
+        f"exit_mismatch={stats.get('exit_ip_mismatch', 0)}, "
         f"provision_failed={stats.get('provision_failed', 0)}"
     )
 
@@ -1716,16 +1745,16 @@ def complete_vless_test_result(result: dict, worker: str = "") -> dict:
             )
             final_status = "approved"
         else:
+            final_status = classify_phone_failure(error)
             conn.execute(
                 """
                 UPDATE vless_tests
-                SET status = 'phone_failed', worker = COALESCE(?, worker), exit_ip = ?, direct_ip = ?,
+                SET status = ?, worker = COALESCE(?, worker), exit_ip = ?, direct_ip = ?,
                     latency_ms = ?, error = ?, reserved_at = NULL, tested_at = ?
                 WHERE id = ?
                 """,
-                (worker or None, exit_ip, direct_ip, latency_ms, error or "phone test failed", now, test_id),
+                (final_status, worker or None, exit_ip, direct_ip, latency_ms, error or "phone test failed", now, test_id),
             )
-            final_status = "phone_failed"
 
     # File/OpenStack side effects are intentionally outside the SQLite transaction.
     if final_status == "approved":
@@ -1747,7 +1776,9 @@ def complete_vless_test_result(result: dict, worker: str = "") -> dict:
             "⚠️ Авто-тестер НЕ подтвердил IP, но IP не забанен автоматически\n"
             f"ID: {test_id}\n"
             f"IP: {record.ip} ({record.region})\n"
-            f"Ошибка: {error or 'phone test failed'}\n\n"
+            f"Статус: {final_status}\n"
+            f"Ошибка: {error or 'phone test failed'}\n"
+            f"Что значит: {phone_failure_human_hint(final_status)}\n\n"
             "Решение: dashboard → Повторить проверку или Удалить IP."
         )
 
@@ -1950,7 +1981,7 @@ def dashboard_html() -> str:
 <script>
 function esc(s){return String(s ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));}
 function age(s){ if(s == null) return '-'; if(s < 60) return s+' сек'; if(s < 3600) return Math.round(s/60)+' мин'; return Math.round(s/3600)+' ч'; }
-function canAct(status){ return ['phone_failed','provision_failed','rejected','error'].includes(status); }
+function canAct(status){ return ['phone_tcp_unreachable','vless_failed','exit_ip_mismatch','phone_failed','provision_failed','rejected','error'].includes(status); }
 function actionButtons(t){
   if(!canAct(t.status)) return '';
   return `<button class="secondary" onclick="dashAction('retry', ${t.id})">🔁 Повторить</button><button class="danger" onclick="dashAction('delete', ${t.id})">🗑 Удалить IP</button>`;
@@ -1974,7 +2005,7 @@ async function load(){
   document.getElementById('target').textContent = 'цель: ' + d.counts.target + ', кандидаты: ' + d.counts.candidates + ', ban: ' + d.counts.banned;
   const q = d.queue || {}; const total = (q.queued||0)+(q.testing||0)+(q.provisioning||0);
   document.getElementById('queueTotal').textContent = total;
-  document.getElementById('queueMeta').textContent = `queued=${q.queued||0}, testing=${q.testing||0}, provisioning=${q.provisioning||0}, approved=${q.approved||0}, phone_failed=${q.phone_failed||0}, provision_failed=${q.provision_failed||0}, banned=${q.manual_banned||0}`;
+  document.getElementById('queueMeta').textContent = `queued=${q.queued||0}, testing=${q.testing||0}, provisioning=${q.provisioning||0}, approved=${q.approved||0}, tcp_unreachable=${q.phone_tcp_unreachable||0}, vless_failed=${q.vless_failed||0}, exit_mismatch=${q.exit_ip_mismatch||0}, phone_failed=${q.phone_failed||0}, provision_failed=${q.provision_failed||0}, banned=${q.manual_banned||0}`;
   document.getElementById('workersTotal').textContent = (d.workers||[]).length;
   document.getElementById('workersMeta').textContent = (d.workers||[]).filter(w=>w.online).length + ' online';
   const c = d.control || {};

@@ -216,3 +216,37 @@ sqlite3 vless_tests.sqlite3 \
 ```
 
 Update `termux_vless_tester.py` on the phone too, because the dashboard receives phone status through `/worker_heartbeat`.
+
+## Error classes in phone testing
+
+The Termux worker now separates phone-side failures into actionable classes:
+
+```text
+phone_tcp_unreachable  Redmi could not open raw TCP to candidate_ip:443.
+                       For the whitelist-search use case this means the IP is not reachable directly from the phone network.
+
+vless_failed           TCP to candidate_ip:443 is reachable, but VLESS/REALITY or curl through the test proxy failed.
+                       Check origin VLESS, REALITY parameters, forwarding/NAT, and sing-box compatibility.
+
+exit_ip_mismatch       VLESS worked, but api.ipify.org returned an IP that does not match the configured expectation.
+
+provision_failed       VPS/server preparation failed before the task was sent to the phone.
+```
+
+Recommended Termux settings for Selectel frontend/forwarding mode:
+
+```bash
+export TESTER_EXPECT_EXIT_IP=any
+export RAW_TCP_CHECK_ENABLED=true
+export RAW_TCP_CHECK_TIMEOUT=8
+```
+
+`TESTER_EXPECT_EXIT_IP` supports:
+
+```text
+any        accept any non-empty api.ipify.org result through the test VLESS
+candidate  require exit IP to equal the candidate IP
+exact      require exit IP to equal EXPECTED_EXIT_IP
+```
+
+For this project, `phone_tcp_unreachable` is a useful negative result: it means the phone network cannot directly reach that candidate IP on 443, so the IP should not be retried automatically. Use the dashboard buttons to delete/ban it or retry manually later.

@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -38,7 +39,15 @@ CURL_TIMEOUT = int(os.getenv("CURL_TIMEOUT", "20"))
 TEST_URL = os.getenv("TEST_URL", "https://api.ipify.org")
 DIRECT_TEST_URL = os.getenv("DIRECT_TEST_URL", TEST_URL)
 HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "30"))
-AGENT_VERSION = "dashboard-1"
+RAW_TCP_CHECK_ENABLED = os.getenv("RAW_TCP_CHECK_ENABLED", "true").strip().lower() in {"1", "true", "yes", "y", "on"}
+RAW_TCP_CHECK_TIMEOUT = float(os.getenv("RAW_TCP_CHECK_TIMEOUT", "8"))
+# Expected exit-IP policy for the curl through the test VLESS.
+# any       => any non-empty api.ipify.org result is accepted (recommended for frontend/forwarding mode)
+# candidate => require exit IP == candidate task IP (old behavior)
+# exact      => require exit IP == EXPECTED_EXIT_IP
+EXPECT_EXIT_IP_MODE = os.getenv("TESTER_EXPECT_EXIT_IP", "any").strip().lower()
+EXPECTED_EXIT_IP = os.getenv("EXPECTED_EXIT_IP", "").strip()
+AGENT_VERSION = "error-classes-1"
 
 LOG_BUFFER: deque[str] = deque(maxlen=80)
 
@@ -267,6 +276,39 @@ def send_heartbeat(control_ok: bool = True, current_task: str = "", last_error: 
     api_post("/worker_heartbeat", payload)
 
 
+
+def tcp_check(host: str, port: int, timeout: float = RAW_TCP_CHECK_TIMEOUT) -> tuple[bool, str, int]:
+    """Try a raw TCP connect from Redmi to the candidate endpoint.
+
+    This detects the most important class for this project: the phone network
+    cannot reach candidate_ip:443 directly, before VLESS/REALITY is even tried.
+    """
+    started = time.time()
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True, "", int((time.time() - started) * 1000)
+    except Exception as e:
+        return False, repr(e)[:300], int((time.time() - started) * 1000)
+
+
+def expected_exit_ok(exit_ip: str, expected_ip: str) -> tuple[bool, str]:
+    mode = EXPECT_EXIT_IP_MODE
+    if mode in {"", "any", "none", "off"}:
+        return True, ""
+    if mode == "candidate":
+        wanted = expected_ip
+    elif mode == "exact":
+        wanted = EXPECTED_EXIT_IP
+    else:
+        # Convenience: TESTER_EXPECT_EXIT_IP=1.2.3.4 means exact IP.
+        wanted = mode
+    if not wanted:
+        return True, ""
+    if exit_ip == wanted:
+        return True, ""
+    return False, f"exit_ip_mismatch expected={wanted} got={exit_ip}"
+
+
 def direct_ip() -> tuple[bool, str | None]:
     try:
         code, out = curl_text(DIRECT_TEST_URL, proxy_port=None, timeout=8)
@@ -285,6 +327,23 @@ def test_vless(task: dict) -> dict:
     direct_ok, direct_seen_ip = direct_ip()
 
     try:
+        outbound = parse_vless_url(vless_url)
+        candidate_host = outbound.get("server") or expected_ip
+        candidate_port = int(outbound.get("server_port") or 443)
+
+        if RAW_TCP_CHECK_ENABLED:
+            tcp_ok, tcp_error, tcp_latency_ms = tcp_check(candidate_host, candidate_port)
+            if not tcp_ok:
+                return {
+                    "id": test_id,
+                    "ok": False,
+                    "exit_ip": None,
+                    "direct_ip": direct_seen_ip,
+                    "direct_ok": direct_ok,
+                    "latency_ms": tcp_latency_ms,
+                    "error": f"phone_tcp_unreachable host={candidate_host} port={candidate_port} error={tcp_error}",
+                }
+
         proc = start_singbox(vless_url, TEST_CONFIG, TEST_PORT)
         code, out = curl_text(TEST_URL, proxy_port=TEST_PORT, timeout=CURL_TIMEOUT)
         latency_ms = int((time.time() - started) * 1000)
@@ -298,10 +357,11 @@ def test_vless(task: dict) -> dict:
                 "direct_ip": direct_seen_ip,
                 "direct_ok": direct_ok,
                 "latency_ms": latency_ms,
-                "error": "curl_through_test_proxy_failed",
+                "error": f"vless_failed curl_code={code} output={exit_ip[:300]}",
             }
 
-        if expected_ip and exit_ip != expected_ip:
+        exit_ok, exit_error = expected_exit_ok(exit_ip, expected_ip)
+        if not exit_ok:
             return {
                 "id": test_id,
                 "ok": False,
@@ -309,7 +369,7 @@ def test_vless(task: dict) -> dict:
                 "direct_ip": direct_seen_ip,
                 "direct_ok": direct_ok,
                 "latency_ms": latency_ms,
-                "error": f"exit_ip_mismatch expected={expected_ip} got={exit_ip}",
+                "error": exit_error,
             }
 
         return {
@@ -330,11 +390,10 @@ def test_vless(task: dict) -> dict:
             "direct_ip": direct_seen_ip,
             "direct_ok": direct_ok,
             "latency_ms": int((time.time() - started) * 1000),
-            "error": repr(e)[:1000],
+            "error": ("vless_failed " + repr(e))[:1000],
         }
     finally:
         stop_process(proc)
-
 
 def append_pending_result(result: dict):
     with PENDING_RESULTS.open("a", encoding="utf-8") as f:
