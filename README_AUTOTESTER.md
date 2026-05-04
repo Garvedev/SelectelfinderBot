@@ -1,12 +1,13 @@
 # Auto VLESS Tester: Redmi A9 + Termux + sing-box
 
-Это обновление заменяет ручную проверку VLESS через Telegram-кнопки на очередь авто-тестера.
+Это обновление заменяет ручную проверку VLESS через Telegram-кнопки на очередь авто-тестера и добавляет безопасный режим ручного решения для проблемных IP.
 
 ## Схема
 
 ```text
 Finder bot / VPS
   -> создает сервер
+  -> проверяет TCP/443 на Floating IP
   -> генерирует VLESS
   -> кладет задачу в SQLite queue
 
@@ -25,9 +26,32 @@ Redmi A9 / Termux
   - `GET /health`
   - `GET /next_tests?worker=redmi-a9&limit=11`
   - `POST /results`
-- Добавлена Telegram-команда `/test_status`.
-- `/status` теперь показывает краткую статистику авто-тестера.
+  - `POST /worker_heartbeat`
+- Добавлены Telegram-команды:
+  - `/test_status`
+  - `/test_stop` / `/pause_testing`
+  - `/test_start` / `/resume_testing`
+- `/status` теперь показывает краткую статистику авто-тестера и pause-состояние.
 - `run_single_vless_test()` больше не ждет кнопки `Работает/Не работает`: он создает сервер и кладет VLESS в очередь.
+- Ошибка телефона больше не банит IP автоматически. IP получает статус `phone_failed` и ждет ручного решения в dashboard.
+- Ошибка создания сервера, cloud-init, TCP/443 или provisioning получает статус `provision_failed` и тоже ждет ручного решения.
+- Dashboard показывает кнопки `Повторить` и `Удалить IP` для `phone_failed`, `provision_failed`, `rejected`, `error`.
+
+## Безопасные статусы
+
+```text
+queued              задача ждет телефона
+testing             задача выдана телефону
+provisioning        идет ручной retry provisioning
+approved            телефон подтвердил ключ
+phone_failed        телефон не подтвердил ключ, IP НЕ забанен
+provision_failed    сервер/VLESS/TCP/443 не подготовились, IP НЕ забанен
+manual_banned       IP удален и забанен вручную через dashboard
+rejected            legacy-статус старых записей
+error               внутренняя ошибка, требуется ручное решение
+```
+
+`phone_failed` и `provision_failed` не возвращаются в очередь автоматически. Повторная проверка делается только вручную через dashboard.
 
 ## Настройки VPS `.env`
 
@@ -39,7 +63,14 @@ TESTER_TOKEN=PASTE_LONG_RANDOM_TOKEN_HERE
 TESTER_BATCH_SIZE=11
 TESTER_LEASE_SECONDS=900
 TESTER_MAX_ATTEMPTS=2
+VLESS_QUEUE_DB=/opt/selectel-finder/vless_tests.sqlite3
+
+PROVISION_TCP_CHECK_ENABLED=true
+PROVISION_TCP_CHECK_TIMEOUT=5
+PROVISION_TCP_CHECK_RETRIES=6
 ```
+
+`TESTER_MAX_ATTEMPTS` теперь влияет в основном на lease/reissue для зависших `testing` задач. Обычный fail от телефона сразу переводит IP в `phone_failed`, без автоматического цикла retry.
 
 Сгенерировать токен:
 
@@ -61,6 +92,71 @@ sudo ./deploy.sh
 
 ```bash
 curl http://127.0.0.1:8787/health
+```
+
+В ответе должны быть поля:
+
+```json
+{
+  "ok": true,
+  "testing_paused": false,
+  "provisioning_paused": false,
+  "stats": {}
+}
+```
+
+## Telegram-команды
+
+```text
+/status
+/test_status
+/test_stop
+/test_start
+/create_servers
+```
+
+`/test_stop`:
+
+```text
+- ставит на паузу выдачу задач телефону;
+- ставит на паузу создание новых серверов;
+- не убивает Termux;
+- не удаляет текущие серверы/IP;
+- уже выданная телефону задача может еще прислать результат.
+```
+
+`/test_start` снимает обе паузы.
+
+## Dashboard actions
+
+Dashboard доступен по адресу:
+
+```text
+http://YOUR_VPS_IP:8787/dashboard
+```
+
+Для проблемных IP появляются кнопки:
+
+```text
+Повторить
+Удалить IP
+```
+
+`Повторить`:
+
+```text
+phone_failed + server_id есть -> возвращает задачу в queued, attempts=0
+provision_failed/error/rejected -> запускает повторное создание сервера
+```
+
+`Удалить IP`:
+
+```text
+- best-effort cleanup server;
+- удаляет Floating IP в Selectel;
+- удаляет IP из good_ips.txt;
+- добавляет IP в banned_ips.txt;
+- переводит запись в manual_banned.
 ```
 
 ## Настройка Termux
@@ -106,46 +202,17 @@ python ~/selectel-tester/termux_vless_tester.py
 curl через test proxy вернул внешний IP, совпадающий с Floating IP кандидата
 ```
 
-Если результат не совпал, был timeout или sing-box не запустился — задача получает fail. После `TESTER_MAX_ATTEMPTS` IP уходит в `banned_ips.txt`.
+Если результат не совпал, был timeout или sing-box не запустился — задача получает `phone_failed`, но IP не банится автоматически.
 
-## Команды Telegram
+## Диагностика
 
-```text
-/status
-/test_status
-/create_servers
+```bash
+cd /opt/selectel-finder
+
+curl http://127.0.0.1:8787/health
+
+sqlite3 vless_tests.sqlite3 \
+"select id, ip, region, status, attempts, worker, exit_ip, latency_ms, error from vless_tests order by id desc limit 20;"
 ```
-
-`/test_status` показывает очередь, последние результаты и состояние API.
-
-## Web dashboard
-
-Dashboard is served by the same tester API process.
-
-```env
-DASHBOARD_ENABLED=true
-DASHBOARD_USERNAME=admin
-DASHBOARD_PASSWORD=CHANGE_ME_LONG_PASSWORD
-DASHBOARD_LOG_LINES=200
-VLESS_QUEUE_DB=/opt/selectel-finder/vless_tests.sqlite3
-```
-
-Open in browser:
-
-```text
-http://YOUR_VPS_IP:8787/dashboard
-```
-
-The browser will ask for login and password using HTTP Basic Auth.
-
-The dashboard shows:
-
-- finder status;
-- approved/candidate/ban counters;
-- VLESS queue counters;
-- latest tests;
-- VPS log tail;
-- Termux worker online/offline status;
-- last Termux worker log tail from heartbeat.
 
 Update `termux_vless_tester.py` on the phone too, because the dashboard receives phone status through `/worker_heartbeat`.

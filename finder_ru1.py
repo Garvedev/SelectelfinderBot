@@ -14,6 +14,7 @@ import json
 import sqlite3
 import html
 import hmac
+import socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 from dataclasses import dataclass, field
@@ -167,6 +168,9 @@ PROVISION_AUTO_FLAVOR_FALLBACK = bool_env("PROVISION_AUTO_FLAVOR_FALLBACK", True
 PROVISION_MAX_FLAVOR_ATTEMPTS = int_env("PROVISION_MAX_FLAVOR_ATTEMPTS", 10)
 PROVISION_SERVER_WAIT_SECONDS = int_env("PROVISION_SERVER_WAIT_SECONDS", 300)
 PROVISION_SETUP_WAIT_SECONDS = int_env("PROVISION_SETUP_WAIT_SECONDS", 120, minimum=0)
+PROVISION_TCP_CHECK_ENABLED = bool_env("PROVISION_TCP_CHECK_ENABLED", True)
+PROVISION_TCP_CHECK_TIMEOUT = int_env("PROVISION_TCP_CHECK_TIMEOUT", 5)
+PROVISION_TCP_CHECK_RETRIES = int_env("PROVISION_TCP_CHECK_RETRIES", 6)
 PROVISION_DECISION_TIMEOUT = int_env("PROVISION_DECISION_TIMEOUT", 300)
 PROVISION_DELETE_SERVER_AFTER_RESULT = bool_env("PROVISION_DELETE_SERVER_AFTER_RESULT", True)
 PROVISION_DELETE_FAILED_FLOATING_IP = bool_env("PROVISION_DELETE_FAILED_FLOATING_IP", True)
@@ -342,6 +346,8 @@ def help_text() -> str:
         "/stop — остановить поиск\n"
         "/status — статус, текущая попытка и настройки\n"
         "/test_status — очередь авто-тестера VLESS\n"
+        "/test_stop — поставить на паузу создание серверов и выдачу задач телефону\n"
+        "/test_start — возобновить создание серверов и выдачу задач телефону\n"
         "/log — показать последние логи\n"
         "/create_servers — создать серверы и выдать ключи из найденных IP\n"
         "/upload — загрузить файл с IP/CIDR\n"
@@ -440,6 +446,11 @@ def cmd_status(message):
         provision_state = "идет" if provisioning_running else "ожидает"
 
     tester_stats = format_vless_queue_stats()
+    control = get_tester_control_state()
+    tester_pause_text = (
+        f"tasks={'paused' if control['testing_paused'] else 'running'}, "
+        f"servers={'paused' if control['provisioning_paused'] else 'running'}"
+    )
 
     bot.reply_to(
         message,
@@ -456,6 +467,7 @@ def cmd_status(message):
         f"🌍 Регионы: {format_regions()}\n"
         f"🧪 Создание серверов: {provision_state}\n"
         f"📲 Авто-тестер: {tester_stats}\n"
+        f"⏯ Test control: {tester_pause_text}\n"
         f"🚫 Бан-лист: {len(load_banned_ips())}"
     )
 
@@ -470,16 +482,23 @@ def cmd_test_status(message):
     recent = get_recent_vless_results(limit=8)
     api_state = "включен" if TESTER_API_ENABLED and TESTER_TOKEN else "выключен/нет токена"
 
+    control = get_tester_control_state()
     lines = [
         "📲 Авто-тестер VLESS",
         f"API: {api_state}",
         f"Адрес: {TESTER_API_HOST}:{TESTER_API_PORT}",
         f"batch: {TESTER_BATCH_SIZE}",
+        f"выдача задач телефону: {'paused ⏸' if control['testing_paused'] else 'running ▶️'}",
+        f"создание серверов: {'paused ⏸' if control['provisioning_paused'] else 'running ▶️'}",
         "",
         "Очередь:",
         f"queued: {stats.get('queued', 0)}",
         f"testing: {stats.get('testing', 0)}",
+        f"provisioning: {stats.get('provisioning', 0)}",
         f"approved: {stats.get('approved', 0)}",
+        f"phone_failed: {stats.get('phone_failed', 0)}",
+        f"provision_failed: {stats.get('provision_failed', 0)}",
+        f"manual_banned: {stats.get('manual_banned', 0)}",
         f"rejected: {stats.get('rejected', 0)}",
         f"error: {stats.get('error', 0)}",
     ]
@@ -496,6 +515,37 @@ def cmd_test_status(message):
             lines.append(f"{status} | {ip}{latency_text} | {worker}")
 
     bot.reply_to(message, "\n".join(lines))
+
+
+@bot.message_handler(commands=["test_stop", "pause_testing"])
+def cmd_test_stop(message):
+    if not allowed(message):
+        bot.reply_to(message, "⛔ Access denied")
+        return
+
+    pause_all_testing()
+    bot.reply_to(
+        message,
+        "⏸ Авто-тесты поставлены на паузу\n"
+        "• телефонный worker останется online, но /next_tests будет возвращать пустой список\n"
+        "• новые серверы создаваться не будут\n"
+        "• уже выданная телефону задача может прислать результат",
+    )
+
+
+@bot.message_handler(commands=["test_start", "resume_testing"])
+def cmd_test_start(message):
+    if not allowed(message):
+        bot.reply_to(message, "⛔ Access denied")
+        return
+
+    resume_all_testing()
+    bot.reply_to(
+        message,
+        "▶️ Авто-тесты возобновлены\n"
+        "• /next_tests снова может выдавать задачи\n"
+        "• /create_servers снова может создавать серверы",
+    )
 
 
 @bot.message_handler(commands=["log"])
@@ -540,6 +590,10 @@ def cmd_log(message):
 def cmd_create_servers(message):
     if not allowed(message):
         bot.reply_to(message, "⛔ Access denied")
+        return
+
+    if is_provisioning_paused():
+        bot.reply_to(message, "⏸ Создание серверов на паузе. Используй /test_start для возобновления.")
         return
 
     try:
@@ -1197,8 +1251,13 @@ def matching_good_ip_records(networks=None, exclude_approved=False) -> list[Good
 # VLESS AUTO-TEST QUEUE / API
 # =========================
 
-FINAL_VLESS_STATUSES = {"approved", "rejected", "error"}
-ACTIVE_VLESS_STATUSES = {"queued", "testing"}
+FINAL_VLESS_STATUSES = {"approved", "phone_failed", "provision_failed", "manual_banned", "deleted", "rejected", "error"}
+ACTIVE_VLESS_STATUSES = {"queued", "testing", "provisioning"}
+REVIEW_VLESS_STATUSES = {"phone_failed", "provision_failed", "error", "rejected"}
+CONTROL_DEFAULTS = {
+    "testing_paused": "0",
+    "provisioning_paused": "0",
+}
 
 
 def now_ts() -> int:
@@ -1254,33 +1313,264 @@ def init_vless_queue():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tester_control (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        for key, value in CONTROL_DEFAULTS.items():
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO tester_control(key, value, updated_at)
+                VALUES (?, ?, ?)
+                """,
+                (key, value, now_ts()),
+            )
 
 
-def enqueue_vless_test(record: GoodIpRecord, server_id: str, vless_key: str) -> int | None:
+def get_tester_control_value(key: str, default: str = "0") -> str:
+    init_vless_queue()
+    with vless_queue_lock, get_vless_queue_conn() as conn:
+        row = conn.execute("SELECT value FROM tester_control WHERE key = ?", (key,)).fetchone()
+        return str(row["value"]) if row else default
+
+
+def set_tester_control_value(key: str, value: str):
+    init_vless_queue()
+    with vless_queue_lock, get_vless_queue_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO tester_control(key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
+            """,
+            (key, value, now_ts()),
+        )
+
+
+def is_testing_paused() -> bool:
+    return get_tester_control_value("testing_paused") == "1"
+
+
+def is_provisioning_paused() -> bool:
+    return get_tester_control_value("provisioning_paused") == "1"
+
+
+def set_testing_paused(paused: bool):
+    set_tester_control_value("testing_paused", "1" if paused else "0")
+
+
+def set_provisioning_paused(paused: bool):
+    set_tester_control_value("provisioning_paused", "1" if paused else "0")
+
+
+def get_tester_control_state() -> dict:
+    return {
+        "testing_paused": is_testing_paused(),
+        "provisioning_paused": is_provisioning_paused(),
+    }
+
+
+def pause_all_testing():
+    set_testing_paused(True)
+    set_provisioning_paused(True)
+
+
+def resume_all_testing():
+    set_testing_paused(False)
+    set_provisioning_paused(False)
+
+
+def enqueue_vless_test(record: GoodIpRecord, server_id: str, vless_key: str, reset_attempts: bool = False) -> int | None:
     init_vless_queue()
     with vless_queue_lock, get_vless_queue_conn() as conn:
         try:
             cur = conn.execute(
                 """
-                INSERT INTO vless_tests(ip, region, ip_id, server_id, vless_key, status, created_at)
-                VALUES (?, ?, ?, ?, ?, 'queued', ?)
+                INSERT INTO vless_tests(ip, region, ip_id, server_id, vless_key, status, attempts, created_at)
+                VALUES (?, ?, ?, ?, ?, 'queued', 0, ?)
                 """,
                 (record.ip, record.region, record.ip_id, server_id, vless_key, now_ts()),
             )
             return int(cur.lastrowid)
         except sqlite3.IntegrityError:
-            row = conn.execute("SELECT id FROM vless_tests WHERE ip = ?", (record.ip,)).fetchone()
-            return int(row["id"]) if row else None
+            row = conn.execute("SELECT id, status FROM vless_tests WHERE ip = ?", (record.ip,)).fetchone()
+            if not row:
+                return None
+            if reset_attempts:
+                conn.execute(
+                    """
+                    UPDATE vless_tests
+                    SET region = ?, ip_id = ?, server_id = ?, vless_key = ?, status = 'queued',
+                        attempts = 0, worker = NULL, exit_ip = NULL, direct_ip = NULL,
+                        latency_ms = NULL, error = NULL, reserved_at = NULL, tested_at = NULL
+                    WHERE id = ?
+                    """,
+                    (record.region, record.ip_id, server_id, vless_key, int(row["id"])),
+                )
+            return int(row["id"])
+
+
+def get_vless_test_by_id(test_id: int) -> dict | None:
+    init_vless_queue()
+    with vless_queue_lock, get_vless_queue_conn() as conn:
+        row = conn.execute("SELECT * FROM vless_tests WHERE id = ?", (int(test_id),)).fetchone()
+        return dict(row) if row else None
+
+
+def get_vless_status_for_ip(ip: str) -> str:
+    init_vless_queue()
+    with vless_queue_lock, get_vless_queue_conn() as conn:
+        row = conn.execute("SELECT status FROM vless_tests WHERE ip = ?", (ip,)).fetchone()
+        return str(row["status"]) if row else ""
 
 
 def has_active_vless_test_ip(ip: str) -> bool:
+    status = get_vless_status_for_ip(ip)
+    return status in ACTIVE_VLESS_STATUSES
+
+
+def has_blocking_vless_test_ip(ip: str) -> bool:
+    """Return True when this IP must not be auto-scheduled again.
+
+    Manual retry from dashboard is still allowed for REVIEW_VLESS_STATUSES.
+    """
+    status = get_vless_status_for_ip(ip)
+    return bool(status and status not in {"deleted", "manual_banned"})
+
+
+def mark_provision_failed(record: GoodIpRecord, error: str, server_id: str = "", vless_key: str = "") -> int | None:
+    init_vless_queue()
+    vless_key = vless_key or make_vless_key(record.ip)
+    error = (error or "provision_failed")[:1000]
+    now = now_ts()
+    with vless_queue_lock, get_vless_queue_conn() as conn:
+        row = conn.execute("SELECT id FROM vless_tests WHERE ip = ?", (record.ip,)).fetchone()
+        if row:
+            test_id = int(row["id"])
+            conn.execute(
+                """
+                UPDATE vless_tests
+                SET region = ?, ip_id = ?, server_id = COALESCE(NULLIF(?, ''), server_id),
+                    vless_key = ?, status = 'provision_failed', attempts = 0,
+                    worker = NULL, exit_ip = NULL, direct_ip = NULL, latency_ms = NULL,
+                    error = ?, reserved_at = NULL, tested_at = ?
+                WHERE id = ?
+                """,
+                (record.region, record.ip_id, server_id, vless_key, error, now, test_id),
+            )
+            return test_id
+
+        cur = conn.execute(
+            """
+            INSERT INTO vless_tests(ip, region, ip_id, server_id, vless_key, status, attempts, error, created_at, tested_at)
+            VALUES (?, ?, ?, ?, ?, 'provision_failed', 0, ?, ?, ?)
+            """,
+            (record.ip, record.region, record.ip_id, server_id, vless_key, error, now, now),
+        )
+        return int(cur.lastrowid)
+
+
+def reset_vless_test_to_queued(test_id: int) -> dict:
     init_vless_queue()
     with vless_queue_lock, get_vless_queue_conn() as conn:
-        row = conn.execute(
-            "SELECT status FROM vless_tests WHERE ip = ?",
-            (ip,),
-        ).fetchone()
-        return bool(row and row["status"] in ACTIVE_VLESS_STATUSES)
+        row = conn.execute("SELECT * FROM vless_tests WHERE id = ?", (int(test_id),)).fetchone()
+        if not row:
+            raise RuntimeError("test not found")
+        status = row["status"]
+        if status not in REVIEW_VLESS_STATUSES:
+            raise RuntimeError(f"retry is allowed only for failed/review statuses, current status={status}")
+        if not row["server_id"]:
+            raise RuntimeError("test has no server_id; use provisioning retry")
+        conn.execute(
+            """
+            UPDATE vless_tests
+            SET status = 'queued', attempts = 0, worker = NULL, exit_ip = NULL, direct_ip = NULL,
+                latency_ms = NULL, error = NULL, reserved_at = NULL, tested_at = NULL
+            WHERE id = ?
+            """,
+            (int(test_id),),
+        )
+        return {"id": int(test_id), "status": "queued"}
+
+
+def start_manual_retry(test_id: int) -> dict:
+    row = get_vless_test_by_id(test_id)
+    if not row:
+        raise RuntimeError("test not found")
+    status = row.get("status") or ""
+    if status not in REVIEW_VLESS_STATUSES:
+        raise RuntimeError(f"retry is allowed only for failed/review statuses, current status={status}")
+
+    if status == "phone_failed" and row.get("server_id") and row.get("vless_key"):
+        return reset_vless_test_to_queued(test_id)
+
+    if is_provisioning_paused():
+        raise RuntimeError("server creation is paused; use /test_start first")
+
+    record = GoodIpRecord(ip=row["ip"], region=row["region"], ip_id=row["ip_id"] or "")
+    with vless_queue_lock, get_vless_queue_conn() as conn:
+        conn.execute(
+            """
+            UPDATE vless_tests
+            SET status = 'provisioning', attempts = 0, worker = NULL, exit_ip = NULL, direct_ip = NULL,
+                latency_ms = NULL, error = 'manual retry: provisioning started', reserved_at = NULL, tested_at = NULL
+            WHERE id = ?
+            """,
+            (int(test_id),),
+        )
+
+    thread = threading.Thread(target=run_single_vless_test, args=(record,), kwargs={"force": True}, daemon=True)
+    thread.start()
+    return {"id": int(test_id), "status": "provisioning"}
+
+
+def manually_delete_vless_test(test_id: int) -> dict:
+    row = get_vless_test_by_id(test_id)
+    if not row:
+        raise RuntimeError("test not found")
+    status = row.get("status") or ""
+    if status == "approved":
+        raise RuntimeError("approved key is not deleted from dashboard")
+
+    record = GoodIpRecord(ip=row["ip"], region=row["region"], ip_id=row["ip_id"] or "")
+    server_id = row.get("server_id") or ""
+    cleanup_errors = []
+    conn = None
+    try:
+        conn = get_connection(record.region)
+        if server_id:
+            try:
+                cleanup_test_server(conn, server_id, record.ip)
+            except Exception as e:
+                cleanup_errors.append(f"server cleanup: {e}")
+        try:
+            delete_floating_ip_address(conn, record.ip, record.ip_id)
+        except Exception as e:
+            cleanup_errors.append(f"floating ip delete: {e}")
+    finally:
+        close_connection(conn)
+
+    ban_ip(record.ip, f"manual_dashboard_delete region={record.region}")
+    remove_good_ip(record.ip)
+    error_text = "; ".join(cleanup_errors) if cleanup_errors else "manual dashboard delete"
+    with vless_queue_lock, get_vless_queue_conn() as db:
+        db.execute(
+            """
+            UPDATE vless_tests
+            SET status = 'manual_banned', worker = NULL, error = ?, reserved_at = NULL, tested_at = ?
+            WHERE id = ?
+            """,
+            (error_text[:1000], now_ts(), int(test_id)),
+        )
+
+    return {"id": int(test_id), "status": "manual_banned", "cleanup_errors": cleanup_errors}
 
 
 def get_vless_queue_stats() -> dict:
@@ -1290,7 +1580,7 @@ def get_vless_queue_stats() -> dict:
             "SELECT status, COUNT(*) AS cnt FROM vless_tests GROUP BY status"
         ).fetchall()
         stats = {row["status"]: int(row["cnt"]) for row in rows}
-    for status in ["queued", "testing", "approved", "rejected", "error"]:
+    for status in ["queued", "testing", "provisioning", "approved", "phone_failed", "provision_failed", "manual_banned", "rejected", "error"]:
         stats.setdefault(status, 0)
     return stats
 
@@ -1301,7 +1591,8 @@ def format_vless_queue_stats() -> str:
         f"queued={stats.get('queued', 0)}, "
         f"testing={stats.get('testing', 0)}, "
         f"approved={stats.get('approved', 0)}, "
-        f"rejected={stats.get('rejected', 0)}"
+        f"phone_failed={stats.get('phone_failed', 0)}, "
+        f"provision_failed={stats.get('provision_failed', 0)}"
     )
 
 
@@ -1411,7 +1702,6 @@ def complete_vless_test_result(result: dict, worker: str = "") -> dict:
         record = GoodIpRecord(ip=row["ip"], region=row["region"], ip_id=row["ip_id"] or "")
         server_id = row["server_id"] or ""
         vless_key = row["vless_key"]
-        attempts = int(row["attempts"] or 0)
         now = now_ts()
 
         if ok:
@@ -1419,59 +1709,49 @@ def complete_vless_test_result(result: dict, worker: str = "") -> dict:
                 """
                 UPDATE vless_tests
                 SET status = 'approved', worker = COALESCE(?, worker), exit_ip = ?, direct_ip = ?,
-                    latency_ms = ?, error = NULL, tested_at = ?
+                    latency_ms = ?, error = NULL, reserved_at = NULL, tested_at = ?
                 WHERE id = ?
                 """,
                 (worker or None, exit_ip, direct_ip, latency_ms, now, test_id),
             )
             final_status = "approved"
-        elif attempts < TESTER_MAX_ATTEMPTS:
-            conn.execute(
-                """
-                UPDATE vless_tests
-                SET status = 'queued', worker = COALESCE(?, worker), exit_ip = ?, direct_ip = ?,
-                    latency_ms = ?, error = ?, tested_at = ?
-                WHERE id = ?
-                """,
-                (worker or None, exit_ip, direct_ip, latency_ms, error, now, test_id),
-            )
-            return {"id": test_id, "saved": True, "status": "retry_queued", "attempts": attempts}
         else:
             conn.execute(
                 """
                 UPDATE vless_tests
-                SET status = 'rejected', worker = COALESCE(?, worker), exit_ip = ?, direct_ip = ?,
-                    latency_ms = ?, error = ?, tested_at = ?
+                SET status = 'phone_failed', worker = COALESCE(?, worker), exit_ip = ?, direct_ip = ?,
+                    latency_ms = ?, error = ?, reserved_at = NULL, tested_at = ?
                 WHERE id = ?
                 """,
-                (worker or None, exit_ip, direct_ip, latency_ms, error, now, test_id),
+                (worker or None, exit_ip, direct_ip, latency_ms, error or "phone test failed", now, test_id),
             )
-            final_status = "rejected"
+            final_status = "phone_failed"
 
     # File/OpenStack side effects are intentionally outside the SQLite transaction.
-    conn = None
-    try:
-        if final_status == "approved":
+    if final_status == "approved":
+        conn = None
+        try:
             save_approved_key(record, vless_key)
             send(TELEGRAM_ALLOWED_CHAT_ID, f"✅ Авто-тестер принял IP: {record.ip} ({record.region}), {latency_ms or '-'} ms")
-        else:
-            ban_ip(record.ip, f"auto_vless_failed region={record.region} worker={worker or '-'}")
-            remove_good_ip(record.ip)
-            send(TELEGRAM_ALLOWED_CHAT_ID, f"🚫 Авто-тестер забанил IP: {record.ip} ({record.region}) — {error or 'fail'}")
-
-        conn = get_connection(record.region)
-        if final_status == "rejected" and PROVISION_DELETE_FAILED_FLOATING_IP:
-            delete_floating_ip_address(conn, record.ip, record.ip_id)
-        if server_id and PROVISION_DELETE_SERVER_AFTER_RESULT:
-            cleanup_test_server(conn, server_id, record.ip)
-    except Exception as e:
-        print(f"⚠️ Post-result cleanup failed for {record.ip}: {e}", flush=True)
-        send(TELEGRAM_ALLOWED_CHAT_ID, f"⚠️ Cleanup после авто-теста не удался для {record.ip}: {e}")
-    finally:
-        close_connection(conn)
+            conn = get_connection(record.region)
+            if server_id and PROVISION_DELETE_SERVER_AFTER_RESULT:
+                cleanup_test_server(conn, server_id, record.ip)
+        except Exception as e:
+            print(f"⚠️ Post-approve cleanup failed for {record.ip}: {e}", flush=True)
+            send(TELEGRAM_ALLOWED_CHAT_ID, f"⚠️ Cleanup после успешного авто-теста не удался для {record.ip}: {e}")
+        finally:
+            close_connection(conn)
+    else:
+        send(
+            TELEGRAM_ALLOWED_CHAT_ID,
+            "⚠️ Авто-тестер НЕ подтвердил IP, но IP не забанен автоматически\n"
+            f"ID: {test_id}\n"
+            f"IP: {record.ip} ({record.region})\n"
+            f"Ошибка: {error or 'phone test failed'}\n\n"
+            "Решение: dashboard → Повторить проверку или Удалить IP."
+        )
 
     return {"id": test_id, "saved": True, "status": final_status}
-
 
 
 def save_worker_heartbeat(payload: dict, worker: str = "") -> dict:
@@ -1596,6 +1876,7 @@ def dashboard_snapshot() -> dict:
             "started_at": fs.get("started_at") or "",
             "selected_regions": get_selected_regions(),
         },
+        "control": get_tester_control_state(),
         "provisioning": {"state": provision_state},
         "counts": {
             "target": TARGET_COUNT,
@@ -1626,7 +1907,7 @@ def dashboard_html() -> str:
     body { margin:0; font-family: system-ui, -apple-system, Segoe UI, sans-serif; background:var(--bg); color:var(--text); }
     header { position:sticky; top:0; z-index:10; background:rgba(11,16,32,.92); border-bottom:1px solid var(--line); padding:14px 18px; backdrop-filter: blur(8px); }
     h1 { margin:0; font-size:20px; }
-    main { padding:18px; max-width:1400px; margin:0 auto; }
+    main { padding:18px; max-width:1500px; margin:0 auto; }
     .grid { display:grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap:14px; }
     .card { background:var(--card); border:1px solid var(--line); border-radius:16px; padding:14px; box-shadow: 0 10px 30px rgba(0,0,0,.18); }
     .card h2 { margin:0 0 10px; font-size:15px; color:#c8d6f7; }
@@ -1642,8 +1923,12 @@ def dashboard_html() -> str:
     .span2 { grid-column: span 2; }
     .badge { display:inline-block; border-radius:999px; padding:2px 8px; background:#1e2a46; border:1px solid var(--line); font-size:12px; }
     .row { display:flex; align-items:center; justify-content:space-between; gap:12px; }
-    button { background:#2563eb; color:white; border:0; border-radius:10px; padding:9px 12px; font-weight:700; cursor:pointer; }
+    button { background:#2563eb; color:white; border:0; border-radius:10px; padding:8px 10px; font-weight:700; cursor:pointer; margin:2px; }
     button:hover { background:#1d4ed8; }
+    button.danger { background:#b91c1c; }
+    button.danger:hover { background:#991b1b; }
+    button.secondary { background:#475569; }
+    button.secondary:hover { background:#334155; }
     @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } .span4,.span2 { grid-column: span 1; } table { font-size:12px; } }
   </style>
 </head>
@@ -1657,7 +1942,7 @@ def dashboard_html() -> str:
     <div class="card"><h2>Workers</h2><div class="num" id="workersTotal">0</div><div class="muted" id="workersMeta"></div></div>
     <div class="card span2"><h2>Телефон / workers</h2><div id="workers"></div></div>
     <div class="card span2"><h2>Состояние</h2><div id="state"></div></div>
-    <div class="card span4"><h2>Последние тесты</h2><div style="overflow:auto"><table id="tests"><thead><tr><th>ID</th><th>IP</th><th>Регион</th><th>Статус</th><th>Поп.</th><th>Worker</th><th>Exit IP</th><th>ms</th><th>Ошибка</th></tr></thead><tbody></tbody></table></div></div>
+    <div class="card span4"><h2>Последние тесты</h2><div style="overflow:auto"><table id="tests"><thead><tr><th>ID</th><th>IP</th><th>Регион</th><th>Статус</th><th>Поп.</th><th>Worker</th><th>Exit IP</th><th>ms</th><th>Ошибка</th><th>Действия</th></tr></thead><tbody></tbody></table></div></div>
     <div class="card span2"><h2>Лог телефона</h2><pre id="phoneLog"></pre></div>
     <div class="card span2"><h2>Лог VPS</h2><pre id="finderLog"></pre></div>
   </div>
@@ -1665,6 +1950,19 @@ def dashboard_html() -> str:
 <script>
 function esc(s){return String(s ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));}
 function age(s){ if(s == null) return '-'; if(s < 60) return s+' сек'; if(s < 3600) return Math.round(s/60)+' мин'; return Math.round(s/3600)+' ч'; }
+function canAct(status){ return ['phone_failed','provision_failed','rejected','error'].includes(status); }
+function actionButtons(t){
+  if(!canAct(t.status)) return '';
+  return `<button class="secondary" onclick="dashAction('retry', ${t.id})">🔁 Повторить</button><button class="danger" onclick="dashAction('delete', ${t.id})">🗑 Удалить IP</button>`;
+}
+async function dashAction(action, id){
+  const label = action === 'delete' ? 'удалить IP, сервер/floating IP и добавить в бан' : 'повторить проверку';
+  if(!confirm(`ID ${id}: ${label}?`)) return;
+  const r = await fetch('/dashboard/api/action', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({action, id})});
+  const data = await r.json().catch(()=>({ok:false,error:'bad json'}));
+  if(!r.ok || !data.ok){ alert('Ошибка: ' + (data.error || r.status)); return; }
+  await load();
+}
 async function load(){
   const r = await fetch('/dashboard/api/status', {cache:'no-store'});
   if(!r.ok){ document.getElementById('updated').textContent='ошибка загрузки: '+r.status; return; }
@@ -1674,19 +1972,20 @@ async function load(){
   document.getElementById('finderMeta').textContent = 'регион: ' + (d.finder.current_region || '-') + ', попытка: ' + d.finder.current_attempt;
   document.getElementById('approved').textContent = d.counts.approved;
   document.getElementById('target').textContent = 'цель: ' + d.counts.target + ', кандидаты: ' + d.counts.candidates + ', ban: ' + d.counts.banned;
-  const q = d.queue || {}; const total = (q.queued||0)+(q.testing||0);
+  const q = d.queue || {}; const total = (q.queued||0)+(q.testing||0)+(q.provisioning||0);
   document.getElementById('queueTotal').textContent = total;
-  document.getElementById('queueMeta').textContent = `queued=${q.queued||0}, testing=${q.testing||0}, approved=${q.approved||0}, rejected=${q.rejected||0}, error=${q.error||0}`;
+  document.getElementById('queueMeta').textContent = `queued=${q.queued||0}, testing=${q.testing||0}, provisioning=${q.provisioning||0}, approved=${q.approved||0}, phone_failed=${q.phone_failed||0}, provision_failed=${q.provision_failed||0}, banned=${q.manual_banned||0}`;
   document.getElementById('workersTotal').textContent = (d.workers||[]).length;
   document.getElementById('workersMeta').textContent = (d.workers||[]).filter(w=>w.online).length + ' online';
-  document.getElementById('state').innerHTML = `<p>Provisioning: <b>${esc(d.provisioning.state)}</b></p><p>Последний IP: <code>${esc(d.finder.last_ip || '-')}</code></p><p>Последняя ошибка: <span class="bad">${esc(d.finder.last_error || '-')}</span></p><p>Регионы: ${esc((d.finder.selected_regions||[]).join(', '))}</p>`;
+  const c = d.control || {};
+  document.getElementById('state').innerHTML = `<p>Testing: <b class="${c.testing_paused?'warn':'ok'}">${c.testing_paused?'paused':'running'}</b></p><p>Provisioning: <b class="${c.provisioning_paused?'warn':'ok'}">${esc(d.provisioning.state)}${c.provisioning_paused?' / paused':''}</b></p><p>Последний IP: <code>${esc(d.finder.last_ip || '-')}</code></p><p>Последняя ошибка: <span class="bad">${esc(d.finder.last_error || '-')}</span></p><p>Регионы: ${esc((d.finder.selected_regions||[]).join(', '))}</p>`;
   const workers = d.workers || [];
   document.getElementById('workers').innerHTML = workers.length ? workers.map(w => `<div style="margin-bottom:10px"><span class="badge ${w.online?'ok':'bad'}">${w.online?'online':'offline'}</span> <b>${esc(w.worker)}</b><br><span class="muted">last seen: ${age(w.age_seconds)}, control=${w.control_ok?'OK':'NO'}, api=${w.api_ok?'OK':'NO'}, task=${esc(w.current_task||'-')}</span><br><span class="bad">${esc(w.last_error||'')}</span></div>`).join('') : '<span class="muted">нет heartbeat от телефона</span>';
   const lastWorker = workers[0];
   document.getElementById('phoneLog').textContent = lastWorker && lastWorker.log_tail ? lastWorker.log_tail : 'Пока нет логов телефона. Обнови termux_vless_tester.py до dashboard-версии.';
   document.getElementById('finderLog').textContent = d.logs.finder || 'лог пуст';
   const tbody = document.querySelector('#tests tbody');
-  tbody.innerHTML = (d.tests||[]).map(t => `<tr><td>${t.id}</td><td><code>${esc(t.ip)}</code></td><td>${esc(t.region)}</td><td><span class="badge">${esc(t.status)}</span></td><td>${t.attempts||0}</td><td>${esc(t.worker||'-')}</td><td>${esc(t.exit_ip||'-')}</td><td>${esc(t.latency_ms||'-')}</td><td class="bad">${esc(t.error||'')}</td></tr>`).join('');
+  tbody.innerHTML = (d.tests||[]).map(t => `<tr><td>${t.id}</td><td><code>${esc(t.ip)}</code></td><td>${esc(t.region)}</td><td><span class="badge">${esc(t.status)}</span></td><td>${t.attempts||0}</td><td>${esc(t.worker||'-')}</td><td>${esc(t.exit_ip||'-')}</td><td>${esc(t.latency_ms||'-')}</td><td class="bad">${esc(t.error||'')}</td><td>${actionButtons(t)}</td></tr>`).join('');
 }
 load(); setInterval(load, 10000);
 </script>
@@ -1762,7 +2061,7 @@ class TesterAPIHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/health":
-            self._send_json(200, {"ok": True, "stats": get_vless_queue_stats()})
+            self._send_json(200, {"ok": True, **get_tester_control_state(), "stats": get_vless_queue_stats()})
             return
 
         if parsed.path == "/dashboard":
@@ -1795,14 +2094,37 @@ class TesterAPIHandler(BaseHTTPRequestHandler):
                 limit = int(limit_raw)
             except ValueError:
                 limit = TESTER_BATCH_SIZE
+            if is_testing_paused():
+                self._send_json(200, {"ok": True, "paused": True, "tasks": []})
+                return
             tasks = reserve_vless_tests(worker=worker, limit=limit)
-            self._send_json(200, {"ok": True, "tasks": tasks})
+            self._send_json(200, {"ok": True, "paused": False, "tasks": tasks})
             return
 
         self._send_json(404, {"ok": False, "error": "not_found"})
 
     def do_POST(self):
         parsed = urlparse(self.path)
+
+        if parsed.path == "/dashboard/api/action":
+            if not self._require_dashboard_auth():
+                return
+            try:
+                payload = self._read_json()
+                action = (payload.get("action") or "").strip().lower()
+                test_id = int(payload.get("id") or 0)
+                if action == "retry":
+                    result = start_manual_retry(test_id)
+                elif action == "delete":
+                    result = manually_delete_vless_test(test_id)
+                else:
+                    raise RuntimeError("unknown action")
+                self._send_json(200, {"ok": True, "result": result, "stats": get_vless_queue_stats()})
+            except Exception as e:
+                print(f"[dashboard] action error: {e}", flush=True)
+                self._send_json(400, {"ok": False, "error": str(e)})
+            return
+
         if not self._authorized():
             self._send_json(401, {"ok": False, "error": "unauthorized"})
             return
@@ -2126,6 +2448,29 @@ def validate_provision_config():
         raise RuntimeError(f"Missing provisioning settings: {', '.join(missing)}")
 
 
+def tcp_connect_ok(host: str, port: int = 443, timeout: int = 5) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def wait_for_tcp_port(host: str, port: int = 443) -> bool:
+    if not PROVISION_TCP_CHECK_ENABLED:
+        return True
+    retries = max(1, PROVISION_TCP_CHECK_RETRIES)
+    timeout = max(1, PROVISION_TCP_CHECK_TIMEOUT)
+    for attempt in range(1, retries + 1):
+        if tcp_connect_ok(host, port=port, timeout=timeout):
+            print(f"✅ TCP/{port} открыт на {host}", flush=True)
+            return True
+        print(f"⏳ TCP/{port} пока закрыт на {host}, попытка {attempt}/{retries}", flush=True)
+        if attempt < retries:
+            time.sleep(5)
+    return False
+
+
 def create_test_server(conn, record: GoodIpRecord):
     region = record.region
     preemptible = region in PROVISION_PREEMPTIBLE_REGIONS
@@ -2245,23 +2590,43 @@ def vless_keyboard(token: str):
     return keyboard
 
 
-def run_single_vless_test(record: GoodIpRecord):
+def run_single_vless_test(record: GoodIpRecord, force: bool = False):
     """Create the temporary server and enqueue its VLESS key for the phone worker.
 
-    The old implementation waited for Telegram buttons. The new flow stores the
-    task in SQLite and lets Redmi/Termux pick it up through /next_tests.
+    Phone failures are not banned automatically. Failed provisioning is stored as
+    provision_failed and can be retried/deleted from the dashboard.
     """
     conn = get_connection(record.region)
     server = None
     vless_key = make_vless_key(record.ip)
 
     try:
-        if has_active_vless_test_ip(record.ip):
-            print(f"ℹ️ IP уже находится в очереди авто-теста: {record.ip}", flush=True)
+        if not force and has_blocking_vless_test_ip(record.ip):
+            print(f"ℹ️ IP уже есть в очереди/на ручном решении авто-теста: {record.ip}", flush=True)
             return
 
         server = create_test_server(conn, record)
-        task_id = enqueue_vless_test(record, server.id, vless_key)
+        server_id = getattr(server, "id", "")
+
+        if not wait_for_tcp_port(record.ip, 443):
+            error = f"tcp_443_not_open after {PROVISION_TCP_CHECK_RETRIES} attempts"
+            task_id = mark_provision_failed(record, error, server_id=server_id, vless_key=vless_key)
+            send(
+                TELEGRAM_ALLOWED_CHAT_ID,
+                "⚠️ Сервер создан, но TCP/443 не открылся; телефон не получит задачу\n"
+                f"ID: {task_id}\n"
+                f"IP: {record.ip}\n"
+                f"Регион: {record.region}\n"
+                "Решение: dashboard → Повторить проверку или Удалить IP.",
+            )
+            if server_id and PROVISION_DELETE_SERVER_AFTER_RESULT:
+                try:
+                    cleanup_test_server(conn, server_id, record.ip)
+                except Exception as cleanup_error:
+                    print(f"⚠️ Cleanup after TCP check failed for {record.ip}: {cleanup_error}", flush=True)
+            return
+
+        task_id = enqueue_vless_test(record, server_id, vless_key, reset_attempts=force)
 
         send(
             TELEGRAM_ALLOWED_CHAT_ID,
@@ -2273,11 +2638,20 @@ def run_single_vless_test(record: GoodIpRecord):
         )
 
     except Exception as e:
-        send(TELEGRAM_ALLOWED_CHAT_ID, f"⚠️ Ошибка постановки {record.ip} ({record.region}) в авто-тест: {e}")
+        server_id = getattr(server, "id", "") if server else ""
+        task_id = mark_provision_failed(record, str(e), server_id=server_id, vless_key=vless_key)
+        send(
+            TELEGRAM_ALLOWED_CHAT_ID,
+            "⚠️ Ошибка создания/подготовки VLESS; IP не забанен автоматически\n"
+            f"ID: {task_id}\n"
+            f"IP: {record.ip} ({record.region})\n"
+            f"Ошибка: {e}\n\n"
+            "Решение: dashboard → Повторить проверку или Удалить IP.",
+        )
         print(f"⚠️ Provisioning/enqueue error for {record.ip}: {e}", flush=True)
-        if server and PROVISION_DELETE_SERVER_AFTER_RESULT:
+        if server_id and PROVISION_DELETE_SERVER_AFTER_RESULT:
             try:
-                cleanup_test_server(conn, server.id, record.ip)
+                cleanup_test_server(conn, server_id, record.ip)
             except Exception as cleanup_error:
                 print(f"⚠️ Cleanup after enqueue error failed for {record.ip}: {cleanup_error}", flush=True)
     finally:
@@ -2292,12 +2666,17 @@ def provisioning_worker(records: list[GoodIpRecord]):
         send(TELEGRAM_ALLOWED_CHAT_ID, f"🧪 Создаю серверы и ставлю в очередь авто-тестера: {len(records)} IP")
 
         for record in records:
+            if is_provisioning_paused():
+                send(TELEGRAM_ALLOWED_CHAT_ID, "⏸ Создание серверов поставлено на паузу. Новые IP не трогаю.")
+                break
             if is_banned_ip(record.ip):
                 continue
-            before = get_vless_queue_stats().get("queued", 0) + get_vless_queue_stats().get("testing", 0)
+            before_stats = get_vless_queue_stats()
+            before = before_stats.get("queued", 0) + before_stats.get("testing", 0) + before_stats.get("provision_failed", 0)
             run_single_vless_test(record)
-            after = get_vless_queue_stats().get("queued", 0) + get_vless_queue_stats().get("testing", 0)
-            if after >= before:
+            after_stats = get_vless_queue_stats()
+            after = after_stats.get("queued", 0) + after_stats.get("testing", 0) + after_stats.get("provision_failed", 0)
+            if after > before:
                 queued += 1
 
         send(
@@ -2313,6 +2692,10 @@ def provisioning_worker(records: list[GoodIpRecord]):
 
 def start_provisioning_if_needed(networks=None):
     global provisioning_running
+
+    if is_provisioning_paused():
+        send(TELEGRAM_ALLOWED_CHAT_ID, "⏸ Создание серверов на паузе. Используй /test_start для возобновления.")
+        return
 
     if not PROVISION_ENABLED:
         send(TELEGRAM_ALLOWED_CHAT_ID, "ℹ️ Автопроверка VLESS выключена: PROVISION_ENABLED=false")
@@ -2332,7 +2715,7 @@ def start_provisioning_if_needed(networks=None):
     records = [
         record
         for record in matching_good_ip_records(networks, exclude_approved=True)
-        if not has_active_vless_test_ip(record.ip)
+        if not has_blocking_vless_test_ip(record.ip)
     ][:slots_left]
     if not records:
         send(TELEGRAM_ALLOWED_CHAT_ID, "⚠️ Нет подходящих IP для VLESS-проверки или все уже в очереди авто-тестера")
