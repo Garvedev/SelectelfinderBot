@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Selectel Finder</title>
+  <link rel="stylesheet" href="/dashboard/assets/styles.css">
+  <script defer src="/dashboard/assets/app.js"></script>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">SF</div>
+        <div>
+          <strong>Selectel Finder</strong>
+          <span id="sideStatus">локальная панель</span>
+        </div>
+      </div>
+      <nav class="nav">
+        <button class="active" data-tab="overview">Обзор</button>
+        <button data-tab="tests">Активные проверки <span id="navTests">0</span></button>
+        <button data-tab="lists">Списки</button>
+        <button data-tab="regions">Регионы</button>
+        <button data-tab="logs">Логи</button>
+        <button data-tab="settings">Настройки</button>
+        <button data-tab="maintenance">Обслуживание</button>
+      </nav>
+    </aside>
+
+    <main class="workspace">
+      <header class="topbar">
+        <div>
+          <h1 id="pageTitle">Обзор</h1>
+          <div id="updated" class="muted">загрузка...</div>
+        </div>
+        <div class="top-actions">
+          <button id="refreshBtn" class="secondary">Обновить</button>
+          <button id="finderStartBtn">Старт поиска</button>
+          <button id="finderStopBtn" class="danger">Стоп</button>
+          <button id="autoModeBtn" class="secondary">Авто</button>
+        </div>
+      </header>
+
+      <div id="alert" class="alert hidden"></div>
+
+      <section class="view active" data-view="overview">
+        <div class="stat-grid">
+          <div class="stat">
+            <span>Поиск IP</span>
+            <strong id="statFinder">-</strong>
+            <small id="statFinderMeta">-</small>
+          </div>
+          <div class="stat">
+            <span>Рабочие ключи</span>
+            <strong id="statApproved">0</strong>
+            <small id="statApprovedMeta">-</small>
+          </div>
+          <div class="stat">
+            <span>Активные задачи</span>
+            <strong id="statActive">0</strong>
+            <small id="statQueueMeta">-</small>
+          </div>
+          <div class="stat">
+            <span>Телефоны</span>
+            <strong id="statPhones">0</strong>
+            <small id="statPhonesMeta">-</small>
+          </div>
+        </div>
+
+        <div class="two-col">
+          <section class="panel">
+            <div class="panel-head">
+              <h2>Состояние</h2>
+            </div>
+            <div id="statePanel" class="info-list"></div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <h2>Метрики</h2>
+            </div>
+            <div id="metricsPanel" class="info-list"></div>
+          </section>
+        </div>
+
+        <div class="two-col">
+          <section class="panel">
+            <div class="panel-head">
+              <h2>Телефон</h2>
+            </div>
+            <div id="workersPanel" class="stack-list"></div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <h2>Журнал действий</h2>
+            </div>
+            <div id="auditPanel" class="audit-list"></div>
+          </section>
+        </div>
+      </section>
+
+      <section class="view" data-view="tests">
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Активные проверки</h2>
+            <span id="testsMeta" class="muted"></span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>IP</th>
+                  <th>Регион</th>
+                  <th>Статус</th>
+                  <th>Попытки</th>
+                  <th>Телефон</th>
+                  <th>Выходной IP</th>
+                  <th>мс</th>
+                  <th>VLESS-ключ</th>
+                  <th>Ошибка</th>
+                  <th>Действия</th>
+                </tr>
+              </thead>
+              <tbody id="testsTable"></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+
+      <section class="view" data-view="lists">
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Списки</h2>
+            <span id="listMeta" class="muted">загрузка...</span>
+          </div>
+          <div class="toolbar">
+            <select id="listName">
+              <option value="approved_vless_keys.txt">approved_vless_keys.txt</option>
+              <option value="good_ips.txt">good_ips.txt</option>
+              <option value="banned_ips.txt">banned_ips.txt</option>
+            </select>
+            <button id="listOpenBtn" class="secondary">Открыть</button>
+            <button id="listSaveBtn">Сохранить</button>
+            <a id="listDownloadBtn" class="button secondary" href="/dashboard/api/list_download?name=approved_vless_keys.txt">Скачать</a>
+            <label class="file-button">Загрузить файл<input id="listUpload" type="file" accept=".txt,text/plain"></label>
+          </div>
+          <textarea id="listEditor" spellcheck="false"></textarea>
+        </section>
+      </section>
+
+      <section class="view" data-view="regions">
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Регионы</h2>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Регион</th>
+                  <th>В поиске</th>
+                  <th>Preemptible</th>
+                  <th>Можно создать</th>
+                  <th>Кандидаты</th>
+                  <th>Ключи</th>
+                  <th>IP не подходит</th>
+                  <th>VLESS ошибка</th>
+                  <th>Ошибка создания</th>
+                  <th>Успех</th>
+                  <th>Последняя ошибка</th>
+                </tr>
+              </thead>
+              <tbody id="regionsTable"></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+
+      <section class="view" data-view="logs">
+        <div class="two-col">
+          <section class="panel">
+            <div class="panel-head">
+              <h2>Лог телефона</h2>
+            </div>
+            <pre id="phoneLog"></pre>
+          </section>
+          <section class="panel">
+            <div class="panel-head">
+              <h2>Лог VPS</h2>
+            </div>
+            <pre id="finderLog"></pre>
+          </section>
+        </div>
+      </section>
+
+      <section class="view" data-view="settings">
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Настройки</h2>
+            <span id="settingsStatus" class="muted">загрузка...</span>
+          </div>
+          <div class="toolbar">
+            <button id="settingsSaveBtn">Сохранить</button>
+            <button id="settingsReloadBtn" class="secondary">Обновить</button>
+            <button data-preset="safe_ru3_ru7" class="secondary">Безопасный ru-3/ru-7</button>
+            <button data-preset="fast_test" class="secondary">Быстрый тест</button>
+            <button data-preset="reliable_provisioning" class="secondary">Надежное создание серверов</button>
+            <button data-preset="keep_failed_ip" class="secondary">Сохранять проблемные IP</button>
+          </div>
+          <div id="settingsRoot" class="settings-root"></div>
+        </section>
+      </section>
+
+      <section class="view" data-view="maintenance">
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Обслуживание</h2>
+            <span id="bulkResult" class="muted"></span>
+          </div>
+          <div class="maintenance-grid">
+            <button id="bulkDeleteBad" class="danger">Удалить все неподходящие IP</button>
+            <button id="bulkRetryVless" class="secondary">Повторить все VLESS-ошибки</button>
+            <div class="inline-action">
+              <select id="bulkRegion"></select>
+              <button id="bulkRegionFailed" class="secondary">Пометить регион как ошибку создания</button>
+            </div>
+            <div class="inline-action">
+              <input id="oldDays" type="number" min="1" max="365" value="7">
+              <button id="bulkDeleteOld" class="danger">Удалить старые ошибки создания</button>
+            </div>
+            <button id="bulkDryRun" class="secondary">Проверить лишние серверы</button>
+            <button id="bulkCleanup" class="danger">Удалить лишние серверы</button>
+          </div>
+        </section>
+      </section>
+    </main>
+  </div>
+</body>
+</html>
