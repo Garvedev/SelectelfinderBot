@@ -142,6 +142,39 @@ OS_COMPUTE_API_VERSION = optional_env("OS_COMPUTE_API_VERSION", "2.72")
 if not OS_PROJECT_ID and not OS_PROJECT_NAME:
     raise RuntimeError("OS_PROJECT_ID or OS_PROJECT_NAME must be set in .env")
 
+
+def openstack_no_proxy_value() -> str:
+    values = [
+        item.strip()
+        for item in optional_env("OPENSTACK_NO_PROXY", "127.0.0.1,localhost").split(",")
+        if item.strip()
+    ]
+    existing = {item.lower() for item in values}
+    for required in ("127.0.0.1", "localhost"):
+        if required not in existing:
+            values.append(required)
+    return ",".join(values)
+
+
+def configure_openstack_proxy():
+    proxy = optional_env("OPENSTACK_PROXY")
+    fallback = bool_env("OPENSTACK_PROXY_FALLBACK_TO_SOCKS5_PROXY", True)
+
+    if not proxy and fallback:
+        proxy = SOCKS5_PROXY
+
+    if not proxy:
+        print("OpenStack proxy: direct", flush=True)
+        return
+
+    no_proxy = openstack_no_proxy_value()
+    for name in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy"):
+        os.environ[name] = proxy
+    os.environ["NO_PROXY"] = no_proxy
+    os.environ["no_proxy"] = no_proxy
+
+    print("OpenStack proxy: enabled", flush=True)
+
 TARGET_COUNT = int_env("TARGET_COUNT", 11)
 GOOD_IP_SYNC_INTERVAL = int_env("GOOD_IP_SYNC_INTERVAL", 300)
 WHITELIST_MAX_BYTES = int_env("WHITELIST_MAX_BYTES", 1024 * 1024)
@@ -232,12 +265,15 @@ if SOCKS5_PROXY:
     }
 
 setup_file_logging()
+configure_openstack_proxy()
 
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
 
 SENSITIVE_ENV_NAMES = [
     "TELEGRAM_BOT_TOKEN",
+    "SOCKS5_PROXY",
+    "OPENSTACK_PROXY",
     "TESTER_TOKEN",
     "CONTROL_VLESS",
     "OS_PASSWORD",

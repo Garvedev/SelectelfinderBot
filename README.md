@@ -149,6 +149,41 @@ SOCKS5_PROXY=
 SOCKS5_PROXY=socks5://user:password@host:port
 ```
 
+## Proxy для Selectel/OpenStack API
+
+`SOCKS5_PROXY` продолжает управлять Telegram. Для запросов OpenStack SDK к Selectel API можно задать отдельный proxy:
+
+```env
+OPENSTACK_PROXY=socks5h://user:pass@host:port
+OPENSTACK_PROXY_FALLBACK_TO_SOCKS5_PROXY=true
+OPENSTACK_NO_PROXY=127.0.0.1,localhost
+```
+
+Если VPS не может напрямую открыть `https://cloud.api.selcloud.ru/identity/v3`, но через SOCKS proxy работает, используйте `OPENSTACK_PROXY=socks5h://...`. Вариант с fallback тоже поддерживается:
+
+```env
+OPENSTACK_PROXY=
+OPENSTACK_PROXY_FALLBACK_TO_SOCKS5_PROXY=true
+SOCKS5_PROXY=socks5h://user:pass@host:port
+```
+
+Проверка прямого доступа:
+
+```bash
+curl -4 -v --connect-timeout 5 --max-time 10 https://cloud.api.selcloud.ru/identity/v3
+```
+
+Проверка через proxy:
+
+```bash
+curl -4 -v --proxy "$SOCKS5_PROXY" \
+  --connect-timeout 10 \
+  --max-time 20 \
+  https://cloud.api.selcloud.ru/identity/v3
+```
+
+Не делайте `source .env` для shell-проверок: в `.env` есть значения с пробелами, например `PROVISION_IMAGE_NAME='Ubuntu 24.04 LTS 64-bit'`. Если нужно прочитать env из shell-скрипта, используйте Python и `dotenv_values`, а не `source`.
+
 ## Настройка Selectel/OpenStack
 
 Минимальные настройки:
