@@ -5,6 +5,9 @@ good_ips.txt
 good_ips.tmp
 banned_ips.txt
 approved_vless_keys.txt
+finder.log
+vless_tests.sqlite3
+vless_tests.sqlite3-*
 ipwhitelist_safe_cidr.tmp
 __pycache__/
 *.pyc

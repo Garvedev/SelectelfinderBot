@@ -2,7 +2,9 @@
 
 Telegram-бот для поиска подходящих Selectel Floating IP, загрузки целевого списка IP/CIDR из файла, выбора регионов поиска и автоматической проверки найденных IP через временные облачные серверы.
 
-Бот работает с OpenStack API Selectel, создает и удаляет Floating IP, ведет списки найденных, забаненных и подтвержденных IP, а после заполнения свободных слотов может создать временный Ubuntu-сервер, установить forwarding-скрипт и отправить VLESS-ключ в Telegram на ручную проверку.
+Бот работает с OpenStack API Selectel, создает и удаляет Floating IP, ведет списки найденных, забаненных и подтвержденных IP, а после заполнения свободных слотов может создать временный Ubuntu-сервер, установить forwarding-скрипт, поставить VLESS-ключ в очередь авто-тестера и принять результат от телефона через Termux worker.
+
+Управлять можно из Telegram и из web dashboard. В dashboard есть ручной режим и полный авто-режим: поиск IP -> создание серверов -> проверка телефоном -> новый поиск до заполнения `TARGET_COUNT` или остановки кнопкой.
 
 ## Возможности
 
@@ -11,11 +13,13 @@ Telegram-бот для поиска подходящих Selectel Floating IP, �
 - Загрузка файла с IP/CIDR только после команды `/upload`.
 - Выбор регионов поиска кнопками через `/regions`.
 - Поиск Floating IP только из загруженного whitelist.
-- Бан-лист плохих IP: при повторном выпадении такие IP сразу удаляются.
+- Бан-лист плохих подсетей: новый ручной бан сохраняется как IPv4 `/24`.
 - Добор только свободных слотов: если уже есть 4 рабочих ключа из 11, бот ищет только 7 новых кандидатов.
 - Автоматический provisioning временного сервера в Selectel для проверки VLESS.
 - Создание preemptible-сервера там, где Selectel поддерживает этот тип.
-- Отправка VLESS-ключа в Telegram с кнопками `Работает` / `Не работает`.
+- Очередь авто-тестера `vless_tests.sqlite3` для выдачи задач телефону.
+- Termux worker для проверки VLESS через отдельный test proxy.
+- Web dashboard с метриками, логами, настройками, bulk-действиями и полным авто-режимом.
 - Сохранение рабочих ключей в локальный файл.
 - Автоудаление временного сервера после проверки.
 
@@ -23,15 +27,21 @@ Telegram-бот для поиска подходящих Selectel Floating IP, �
 
 ```text
 .
+├── .github/
+│   └── workflows/
+│       └── deploy.yml            # GitHub Actions deploy workflow
+├── .env.example                  # пример конфигурации без секретов
+├── .gitignore
 ├── finder_ru1.py                 # основной Telegram/OpenStack бот
 ├── ipwhitelist_safe_cidr.example.txt # пример списка целевых IP/CIDR
+├── termux_vless_tester.py        # worker для Redmi/Termux/sing-box
+├── README_AUTOTESTER.md          # подробная документация авто-тестера
 ├── requirements.txt              # Python-зависимости
 ├── deploy.sh                     # серверный deploy/update скрипт
 ├── rc.example.sh                 # пример Selectel OpenStack rc-файла
 ├── systemd/
 │   └── finder.service            # systemd unit template
-├── .env.example                  # пример конфигурации без секретов
-└── .gitignore
+└── README.md
 ```
 
 Файлы состояния создаются во время работы и не должны попадать в git:
@@ -43,6 +53,9 @@ ipwhitelist_safe_cidr.txt
 good_ips.txt
 banned_ips.txt
 approved_vless_keys.txt
+finder.log
+vless_tests.sqlite3
+vless_tests.sqlite3-*
 *.tmp
 .venv/
 __pycache__/
@@ -64,6 +77,7 @@ openstacksdk
 pyTelegramBotAPI
 requests[socks]
 python-dotenv
+aiohttp
 ```
 
 ## Быстрый локальный запуск
@@ -168,9 +182,12 @@ TARGET_COUNT=11
 REGIONS=ru-1,ru-2,ru-3,ru-6,ru-7,ru-8,ru-9
 GOOD_IP_SYNC_INTERVAL=300
 WHITELIST_MAX_BYTES=1048576
+LOG_FILE=/opt/selectel-finder/finder.log
 ```
 
 `TARGET_COUNT` означает общее количество рабочих ключей, а не количество новых IP на каждый запуск.
+
+`LOG_FILE` можно не задавать. По умолчанию лог пишется в `finder.log` рядом с `finder_ru1.py`.
 
 Пример:
 
@@ -227,6 +244,38 @@ WHITELIST_MAX_BYTES=1048576
 ```
 
 Сверить `good_ips.txt` с OpenStack и удалить устаревшие записи.
+
+```text
+/create_servers
+```
+
+Запустить создание временных серверов и постановку найденных кандидатов в очередь авто-тестера.
+
+```text
+/test_status
+```
+
+Показать состояние очереди авто-тестера, worker-статусы и последние результаты.
+
+```text
+/test_stop
+/pause_testing
+```
+
+Поставить на паузу выдачу задач телефону и создание новых серверов. Уже выданная телефону задача может еще прислать результат.
+
+```text
+/test_start
+/resume_testing
+```
+
+Снять паузу с выдачи задач и создания серверов.
+
+```text
+/log
+```
+
+Отправить последние 200 строк `finder.log`, а если файла нет — последние строки `journalctl -u finder`.
 
 ## Загрузка файла с IP/CIDR
 
@@ -285,23 +334,91 @@ WHITELIST_MAX_BYTES=1048576
 4. Если IP подходит, сохраняет его в `good_ips.txt`.
 5. Если IP не подходит, удаляет его из Selectel.
 6. Если IP в `banned_ips.txt`, сразу удаляет его.
-7. Когда новых кандидатов достаточно для свободных слотов, поиск останавливается и запускается VLESS-проверка.
+7. IP, которые уже есть в очереди авто-тестера или ждут ручного решения, не считаются свободными кандидатами.
+8. Когда новых кандидатов достаточно для свободных слотов, в ручном режиме поиск останавливается и предлагает `/create_servers`; в полном авто-режиме сразу запускается VLESS-проверка.
 
 ## Слоты, approved и ban
 
 `approved_vless_keys.txt` содержит рабочие ключи. Каждый IP в этом файле занимает один слот.
 
-`banned_ips.txt` содержит IP, которые были отмечены как нерабочие. Такие IP:
+`banned_ips.txt` содержит забаненные подсети CIDR. Новый ручной бан IP сохраняется как подсеть `/24`, например `139.100.193.0/24`. Такие подсети:
 
 - не считаются кандидатами;
 - удаляются из `good_ips.txt`;
-- при повторном выпадении сразу удаляются из Selectel.
+- при повторном выпадении любого IP из подсети сразу удаляются из Selectel.
 
 `good_ips.txt` содержит новые подходящие IP-кандидаты, которые еще надо проверить.
 
+## Dashboard
+
+Dashboard доступен на том же HTTP API, что и авто-тестер:
+
+```text
+http://YOUR_VPS_IP:8787/dashboard
+```
+
+Для включения dashboard в `.env` нужны:
+
+```env
+DASHBOARD_ENABLED=true
+DASHBOARD_USERNAME=admin
+DASHBOARD_PASSWORD=CHANGE_ME
+DASHBOARD_LOG_LINES=200
+```
+
+Если `DASHBOARD_PASSWORD` пустой, dashboard вернет `503` и не откроется. Авторизация простая HTTP Basic Auth.
+
+В dashboard есть:
+
+- карточка `Finder` с кнопками `Старт`, `Стоп`, `Включить авто` / `Выключить авто`;
+- карточки approved, queue, workers, metrics;
+- таблица регионов;
+- последние тесты с кнопками `Повторить` и `Удалить IP`;
+- логи телефона и VPS;
+- audit последних dashboard-действий;
+- страница `/dashboard/settings` для runtime-настроек без редактирования `.env`.
+
+Полный авто-режим делает цикл сам:
+
+```text
+поиск IP -> набор кандидатов -> создание серверов -> проверка телефоном -> новый поиск
+```
+
+Цикл продолжается до заполнения `TARGET_COUNT`, кнопки `Стоп` или `Выключить авто`. Кнопка `Стоп` выключает и обычный поиск, и полный авто-режим.
+
+Runtime-настройки dashboard хранятся в `vless_tests.sqlite3` и перекрывают значения из `.env` до сброса. Доступные группы:
+
+- Finder: `TARGET_COUNT`, `SELECTED_REGIONS`, `GOOD_IP_SYNC_INTERVAL`;
+- Provisioning: preemptible-регионы, обычные серверы, ожидания, flavor attempts;
+- TCP check: timeout/retries;
+- Cleanup: удаление временного сервера и failed Floating IP;
+- Phone worker: batch, lease, max attempts.
+
+Presets:
+
+```text
+safe_ru3_ru7
+fast_test
+reliable_provisioning
+keep_failed_ip
+```
+
+Bulk-действия:
+
+```text
+Удалить все IP не подходят
+Retry все vless_failed
+Регион в provision_failed
+Удалить старые provision_failed
+Reconcile dry-run
+Cleanup stale temp servers
+```
+
 ## Автоматическая VLESS-проверка
 
-Когда найдено достаточно новых кандидатов, бот запускает provisioning.
+Provisioning запускается вручную через `/create_servers`, через кнопку создания серверов, либо автоматически при включенном полном авто-режиме.
+
+Подробная схема VPS API, Termux worker и классов ошибок описана в `README_AUTOTESTER.md`.
 
 Настройки:
 
@@ -325,7 +442,8 @@ PROVISION_SERVER_NAME_PREFIX=selectel-finder
 7. Подключает найденный Floating IP.
 8. Через cloud-init выполняет установку forwarding.
 9. Формирует VLESS-ключ с подстановкой IP.
-10. Отправляет ключ в Telegram с кнопками `Работает` / `Не работает`.
+10. Ставит VLESS-ключ в SQLite-очередь `vless_tests.sqlite3`.
+11. Termux worker забирает задачу, проверяет ключ через test proxy и отправляет результат обратно в API.
 
 Команды, которые выполняются на сервере через cloud-init:
 
@@ -335,21 +453,27 @@ export ORIGIN_IP="$PROVISION_ORIGIN_IP"
 sudo -E bash forwarding_install.sh
 ```
 
-После ответа в Telegram временный сервер удаляется, если включено:
+После успешной проверки временный сервер удаляется, если включено:
 
 ```env
 PROVISION_DELETE_SERVER_AFTER_RESULT=true
 ```
 
-Если нажать `Работает`:
+Если телефон подтвердил ключ:
 
 - ключ сохраняется в `approved_vless_keys.txt`;
 - IP занимает слот;
 - бот переходит к следующему кандидату.
 
-Если нажать `Не работает`:
+Если телефон не подтвердил ключ:
 
-- IP сохраняется в `banned_ips.txt`;
+- IP получает статус `phone_failed`, `vless_failed`, `exit_ip_mismatch` или `ip_not_suitable`;
+- IP не банится автоматически;
+- решение принимается в dashboard кнопками `Повторить` или `Удалить IP`.
+
+Если в dashboard нажать `Удалить IP`:
+
+- подсеть IP сохраняется в `banned_ips.txt`;
 - удаляется из `good_ips.txt`;
 - Floating IP удаляется из Selectel, если включено:
 
@@ -509,6 +633,7 @@ sudo ./deploy.sh
 
 ```bash
 python -m py_compile finder_ru1.py
+python -m py_compile termux_vless_tester.py
 python -c "import finder_ru1; print('import ok')"
 ```
 
@@ -525,9 +650,10 @@ python -c "import finder_ru1; print('import ok')"
 ## Безопасность
 
 - Не коммитьте `.env`.
-- Не коммитьте `good_ips.txt`, `banned_ips.txt`, `approved_vless_keys.txt`.
+- Не коммитьте `good_ips.txt`, `banned_ips.txt`, `approved_vless_keys.txt`, `vless_tests.sqlite3`, `finder.log`.
 - Если токен Telegram или пароль Selectel попал в переписку, скриншот или git, перевыпустите его.
 - Храните OpenStack пароль в одинарных кавычках, если в нем есть `$`.
+- Закрывайте dashboard паролем через `DASHBOARD_PASSWORD`; без него dashboard не откроется.
 - Перед публичным push проверьте:
 
 ```bash
@@ -545,13 +671,22 @@ git diff
 5. Настроить регионы через `/regions`.
 6. Отправить `/start`.
 7. Дождаться поиска новых кандидатов.
-8. После получения VLESS-ключа проверить его вручную.
-9. Нажать `Работает` или `Не работает`.
-10. Повторять до заполнения `TARGET_COUNT` рабочих ключей.
+8. Отправить `/create_servers` или нажать кнопку создания серверов.
+9. Дождаться, пока Termux worker проверит задачи.
+10. Проблемные IP обработать в dashboard: `Повторить` или `Удалить IP`.
+11. Повторять до заполнения `TARGET_COUNT` рабочих ключей.
 
-## Будущий автодеплой
+Полностью автоматический сценарий:
 
-В проект добавлен GitHub Actions workflow:
+1. Запустить бота и Termux worker.
+2. Открыть `/dashboard`.
+3. Нажать `Включить авто`.
+4. Наблюдать за очередью, worker-статусом и логами.
+5. Остановить цикл кнопкой `Стоп` или `Выключить авто`.
+
+## GitHub Actions deploy
+
+В проекте есть GitHub Actions workflow:
 
 ```text
 .github/workflows/deploy.yml
@@ -567,6 +702,7 @@ DEPLOY_PORT       # SSH port, обычно 22
 DEPLOY_USER       # пользователь для SSH
 DEPLOY_SSH_KEY    # приватный SSH key без passphrase или key, поддерживаемый CI
 DEPLOY_PATH       # путь к проекту на сервере, например /opt/selectel-finder
+ENV_FILE          # полное содержимое .env для сервера
 ```
 
 На сервере пользователь `DEPLOY_USER` должен уметь:

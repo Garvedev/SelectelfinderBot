@@ -77,6 +77,7 @@ GOOD_IPS_FILE = BASE_DIR / "good_ips.txt"
 BANNED_IPS_FILE = BASE_DIR / "banned_ips.txt"
 APPROVED_KEYS_FILE = BASE_DIR / "approved_vless_keys.txt"
 LOG_FILE = Path(os.getenv("LOG_FILE", str(BASE_DIR / "finder.log")).strip() or str(BASE_DIR / "finder.log"))
+BANNED_IPV4_PREFIX = 24
 
 
 def required_env(name: str) -> str:
@@ -391,69 +392,132 @@ def help_text() -> str:
     )
 
 
-@bot.message_handler(commands=["start"])
-def cmd_start(message):
+def start_finder(actor: str = "telegram") -> dict:
     global running, last_good_ip_sync
 
-    if not allowed(message):
-        bot.reply_to(message, "⛔ Access denied")
-        return
-
     if running:
-        bot.reply_to(message, "✅ Поиск уже запущен")
-        return
+        return {"ok": True, "started": False, "status": "already_running", "message": "✅ Поиск уже запущен"}
 
-    try:
-        networks = load_whitelist()
-    except Exception as e:
-        bot.reply_to(message, f"⚠️ Не могу запустить поиск: {e}")
-        return
+    networks = load_whitelist()
 
     approved, existing_candidates, left_to_find = remaining_ips_to_find(networks)
     current_target = target_count()
+    candidate_slots = current_target - approved
+
     if approved >= current_target:
-        bot.reply_to(message, f"✅ Уже есть {approved}/{current_target} рабочих ключей. Добор не нужен.")
-        return
+        return {
+            "ok": True,
+            "started": False,
+            "status": "target_ready",
+            "approved": approved,
+            "target": current_target,
+            "message": f"✅ Уже есть {approved}/{current_target} рабочих ключей. Добор не нужен.",
+        }
 
     if left_to_find <= 0:
-        bot.reply_to(
-            message,
-            "✅ Кандидаты уже набраны. Поиск не нужен.\n"
-            f"✅ Принято ключей: {approved}/{current_target}\n"
-            f"📦 Найдено кандидатов: {existing_candidates}/{current_target - approved}\n\n"
-            "Чтобы создать серверы и выдать ключи, нажми /create_servers.",
-            reply_markup=create_servers_keyboard(),
-        )
-        return
+        return {
+            "ok": True,
+            "started": False,
+            "status": "candidates_ready",
+            "approved": approved,
+            "target": current_target,
+            "existing_candidates": existing_candidates,
+            "candidate_slots": candidate_slots,
+            "left_to_find": left_to_find,
+            "message": (
+                "✅ Кандидаты уже набраны. Поиск не нужен.\n"
+                f"✅ Принято ключей: {approved}/{current_target}\n"
+                f"📦 Найдено кандидатов: {existing_candidates}/{candidate_slots}"
+            ),
+        }
 
     if not get_selected_regions():
-        bot.reply_to(message, "⚠️ Не выбран ни один регион")
-        return
+        raise RuntimeError("Не выбран ни один регион")
 
     last_good_ip_sync = 0
     running = True
     update_finder_state(current_attempt=0, current_region="", last_ip="", last_error="", started_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+    result = {
+        "ok": True,
+        "started": True,
+        "status": "started",
+        "whitelist_count": len(networks),
+        "approved": approved,
+        "target": current_target,
+        "existing_candidates": existing_candidates,
+        "candidate_slots": candidate_slots,
+        "left_to_find": left_to_find,
+        "regions": get_selected_regions(),
+        "message": (
+            "🚀 Поиск IP запущен\n"
+            f"🎯 Целей: {len(networks)}\n"
+            f"✅ Принято ключей: {approved}/{current_target}\n"
+            f"📦 Уже найдено кандидатов: {existing_candidates}/{candidate_slots}\n"
+            f"🔎 Осталось найти IP: {left_to_find}\n"
+            f"🌍 Регионы: {format_regions()}"
+        ),
+    }
+    audit_log("finder_start", "", result, actor=actor)
+    return result
+
+
+def stop_finder(actor: str = "telegram") -> dict:
+    global running
+
+    was_running = running
+    auto_was_enabled = is_full_auto_mode_enabled()
+    if auto_was_enabled:
+        set_full_auto_mode(False)
+    running = False
+    result = {
+        "ok": True,
+        "stopped": was_running,
+        "status": "stopped" if was_running else "already_stopped",
+        "auto_mode_disabled": auto_was_enabled,
+        "message": (
+            "⏸ Поиск IP остановлен, авто-режим выключен"
+            if auto_was_enabled
+            else ("⏸ Поиск IP остановлен" if was_running else "ℹ️ Поиск IP уже остановлен")
+        ),
+    }
+    audit_log("finder_stop", "", result, actor=actor)
+    return result
+
+
+@bot.message_handler(commands=["start"])
+def cmd_start(message):
+    if not allowed(message):
+        bot.reply_to(message, "⛔ Access denied")
+        return
+
+    try:
+        result = start_finder(actor="telegram")
+    except Exception as e:
+        bot.reply_to(message, f"⚠️ Не могу запустить поиск: {e}")
+        return
+
+    if result.get("status") == "candidates_ready":
+        bot.reply_to(
+            message,
+            f"{result['message']}\n\nЧтобы создать серверы и выдать ключи, нажми /create_servers.",
+            reply_markup=create_servers_keyboard(),
+        )
+        return
+
     bot.reply_to(
         message,
-        "🚀 Поиск IP запущен\n"
-        f"🎯 Целей: {len(networks)}\n"
-        f"✅ Принято ключей: {approved}/{current_target}\n"
-        f"📦 Уже найдено кандидатов: {existing_candidates}/{current_target - approved}\n"
-        f"🔎 Осталось найти IP: {left_to_find}\n"
-        f"🌍 Регионы: {format_regions()}",
+        result["message"],
     )
 
 
 @bot.message_handler(commands=["stop"])
 def cmd_stop(message):
-    global running
-
     if not allowed(message):
         bot.reply_to(message, "⛔ Access denied")
         return
 
-    running = False
-    bot.reply_to(message, "⏸ Поиск IP остановлен")
+    result = stop_finder(actor="telegram")
+    bot.reply_to(message, result["message"])
 
 
 @bot.message_handler(commands=["status"])
@@ -483,6 +547,7 @@ def cmd_status(message):
     tester_stats = format_vless_queue_stats()
     control = get_tester_control_state()
     tester_pause_text = (
+        f"auto={'on' if control['full_auto_mode'] else 'off'}, "
         f"tasks={'paused' if control['testing_paused'] else 'running'}, "
         f"servers={'paused' if control['provisioning_paused'] else 'running'}"
     )
@@ -523,6 +588,7 @@ def cmd_test_status(message):
         f"API: {api_state}",
         f"Адрес: {TESTER_API_HOST}:{TESTER_API_PORT}",
         f"batch: {tester_batch_size()}",
+        f"полный авто-режим: {'on' if control['full_auto_mode'] else 'off'}",
         f"выдача задач телефону: {'paused ⏸' if control['testing_paused'] else 'running ▶️'}",
         f"создание серверов: {'paused ⏸' if control['provisioning_paused'] else 'running ▶️'}",
         "",
@@ -1003,41 +1069,70 @@ def write_good_ips(records: list[GoodIpRecord]):
     temp_file.replace(GOOD_IPS_FILE)
 
 
-def load_banned_ips() -> set[str]:
+def banned_network_for_ip(ip: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network:
+    ip_obj = ipaddress.ip_address(ip)
+    prefix = BANNED_IPV4_PREFIX if ip_obj.version == 4 else ip_obj.max_prefixlen
+    return ipaddress.ip_network(f"{ip_obj}/{prefix}", strict=False)
+
+
+def parse_banned_network(token: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network | None:
+    token = token.strip()
+    if not token:
+        return None
+    try:
+        if "/" in token:
+            return ipaddress.ip_network(token, strict=False)
+        return banned_network_for_ip(token)
+    except ValueError:
+        return None
+
+
+def load_banned_ips() -> set[ipaddress.IPv4Network | ipaddress.IPv6Network]:
     if not BANNED_IPS_FILE.exists():
         return set()
 
     banned = set()
     with open(BANNED_IPS_FILE, "r", encoding="utf-8") as f:
         for line in f:
-            ip = line.strip().split(maxsplit=1)[0] if line.strip() else ""
-            if not ip:
-                continue
-            try:
-                ipaddress.ip_address(ip)
-            except ValueError:
-                continue
-            banned.add(ip)
+            token = line.strip().split(maxsplit=1)[0] if line.strip() else ""
+            network = parse_banned_network(token)
+            if network:
+                banned.add(network)
 
     return banned
 
 
+def ip_in_banned_networks(ip: str, banned_networks) -> bool:
+    try:
+        ip_obj = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(ip_obj in network for network in banned_networks)
+
+
 def is_banned_ip(ip: str) -> bool:
-    return ip in load_banned_ips()
+    return ip_in_banned_networks(ip, load_banned_ips())
 
 
 def ban_ip(ip: str, reason: str = ""):
+    network = banned_network_for_ip(ip)
     banned = load_banned_ips()
-    if ip in banned:
+    if network in banned:
         return
 
     with open(BANNED_IPS_FILE, "a", encoding="utf-8") as f:
         suffix = f" {reason}" if reason else ""
-        f.write(f"{ip}{suffix}\n")
+        f.write(f"{network}{suffix}\n")
 
 
 def remove_good_ip(ip: str):
     records = [record for record in load_good_ips() if record.ip != ip]
+    write_good_ips(records)
+
+
+def remove_banned_good_ips():
+    banned = load_banned_ips()
+    records = [record for record in load_good_ips() if not ip_in_banned_networks(record.ip, banned)]
     write_good_ips(records)
 
 
@@ -1092,14 +1187,26 @@ def count_matching_good_ips(networks=None, exclude_approved=False) -> int:
     records = load_good_ips()
     banned = load_banned_ips()
     approved = load_approved_ips() if exclude_approved else set()
+    blocking = load_blocking_vless_ips()
     if networks is None:
-        return len([record for record in records if record.ip not in banned and record.ip not in approved])
+        return len(
+            [
+                record
+                for record in records
+                if not ip_in_banned_networks(record.ip, banned)
+                and record.ip not in approved
+                and record.ip not in blocking
+            ]
+        )
 
     return len(
         [
             record
             for record in records
-            if record.ip not in banned and record.ip not in approved and ip_allowed(record.ip, networks)
+            if not ip_in_banned_networks(record.ip, banned)
+            and record.ip not in approved
+            and record.ip not in blocking
+            and ip_allowed(record.ip, networks)
         ]
     )
 
@@ -1248,15 +1355,16 @@ def sync_good_ips(networks=None, exclude_approved=False) -> int:
     matching_count = 0
     banned = load_banned_ips()
     approved = load_approved_ips() if exclude_approved else set()
+    blocking = load_blocking_vless_ips()
 
     for record in records:
-        if record.ip in banned:
+        if ip_in_banned_networks(record.ip, banned):
             print(f"⚠️ Удаляю забаненную запись good_ips.txt: {record.ip}", flush=True)
             continue
 
         if saved_ip_active(record):
             active_records.append(record)
-            if record.ip not in approved and (networks is None or ip_allowed(record.ip, networks)):
+            if record.ip not in approved and record.ip not in blocking and (networks is None or ip_allowed(record.ip, networks)):
                 matching_count += 1
         else:
             print(f"⚠️ Удаляю устаревшую запись good_ips.txt: {record.ip}", flush=True)
@@ -1270,12 +1378,15 @@ def sync_good_ips(networks=None, exclude_approved=False) -> int:
 def matching_good_ip_records(networks=None, exclude_approved=False) -> list[GoodIpRecord]:
     banned = load_banned_ips()
     approved = load_approved_ips() if exclude_approved else set()
+    blocking = load_blocking_vless_ips()
     records = []
 
     for record in load_good_ips():
-        if record.ip in banned:
+        if ip_in_banned_networks(record.ip, banned):
             continue
         if record.ip in approved:
+            continue
+        if record.ip in blocking:
             continue
         if networks is not None and not ip_allowed(record.ip, networks):
             continue
@@ -1297,6 +1408,7 @@ REVIEW_VLESS_STATUSES = {"provision_failed", "error", "rejected", *PHONE_FAILURE
 CONTROL_DEFAULTS = {
     "testing_paused": "0",
     "provisioning_paused": "0",
+    "full_auto_mode": "0",
 }
 
 
@@ -1415,6 +1527,10 @@ def is_provisioning_paused() -> bool:
     return get_tester_control_value("provisioning_paused") == "1"
 
 
+def is_full_auto_mode_enabled() -> bool:
+    return get_tester_control_value("full_auto_mode") == "1"
+
+
 def set_testing_paused(paused: bool):
     set_tester_control_value("testing_paused", "1" if paused else "0")
 
@@ -1423,10 +1539,15 @@ def set_provisioning_paused(paused: bool):
     set_tester_control_value("provisioning_paused", "1" if paused else "0")
 
 
+def set_full_auto_mode(enabled: bool):
+    set_tester_control_value("full_auto_mode", "1" if enabled else "0")
+
+
 def get_tester_control_state() -> dict:
     return {
         "testing_paused": is_testing_paused(),
         "provisioning_paused": is_provisioning_paused(),
+        "full_auto_mode": is_full_auto_mode_enabled(),
     }
 
 
@@ -1996,6 +2117,19 @@ def get_vless_status_for_ip(ip: str) -> str:
         return str(row["status"]) if row else ""
 
 
+def load_blocking_vless_ips() -> set[str]:
+    init_vless_queue()
+    with vless_queue_lock, get_vless_queue_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT ip
+            FROM vless_tests
+            WHERE status NOT IN ('deleted', 'manual_banned')
+            """
+        ).fetchall()
+    return {str(row["ip"]) for row in rows if row["ip"]}
+
+
 def has_active_vless_test_ip(ip: str) -> bool:
     status = get_vless_status_for_ip(ip)
     return status in ACTIVE_VLESS_STATUSES
@@ -2139,7 +2273,7 @@ def manually_delete_vless_test(test_id: int, actor: str = "dashboard") -> dict:
         close_connection(conn)
 
     ban_ip(record.ip, f"manual_dashboard_delete region={record.region}")
-    remove_good_ip(record.ip)
+    remove_banned_good_ips()
     error_text = "; ".join(cleanup_errors) if cleanup_errors else "manual dashboard delete"
     with vless_queue_lock, get_vless_queue_conn() as db:
         db.execute(
@@ -2819,6 +2953,7 @@ def dashboard_html() -> str:
     button.danger:hover { background:#991b1b; }
     button.secondary, a.button.secondary { background:#475569; }
     button.secondary:hover, a.button.secondary:hover { background:#334155; }
+    button:disabled, button:disabled:hover { background:#334155; cursor:not-allowed; opacity:.55; }
     @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } .span4,.span2 { grid-column: span 1; } table { font-size:12px; } }
   </style>
 </head>
@@ -2827,7 +2962,7 @@ def dashboard_html() -> str:
 <main>
   <p><a class="button secondary" href="/dashboard/settings">Настройки</a></p>
   <div class="grid">
-    <div class="card"><h2>Finder</h2><div class="num" id="finderState">-</div><div class="muted" id="finderMeta"></div></div>
+    <div class="card"><h2>Finder</h2><div class="num" id="finderState">-</div><div class="muted" id="finderMeta"></div><div class="toolbar" style="margin-top:10px"><button id="finderStartBtn" onclick="finderControl('start')">Старт</button><button id="finderStopBtn" class="danger" onclick="finderControl('stop')">Стоп</button><button id="autoModeBtn" class="secondary" onclick="finderControl('auto_toggle')">Авто</button></div><div class="muted" id="finderActionResult"></div></div>
     <div class="card"><h2>Approved</h2><div class="num ok" id="approved">0</div><div class="muted" id="target"></div></div>
     <div class="card"><h2>Queue</h2><div class="num" id="queueTotal">0</div><div class="muted" id="queueMeta"></div></div>
     <div class="card"><h2>Workers</h2><div class="num" id="workersTotal">0</div><div class="muted" id="workersMeta"></div></div>
@@ -2874,6 +3009,20 @@ async function dashAction(action, id){
   if(!r.ok || !data.ok){ alert('Ошибка: ' + (data.error || r.status)); return; }
   await load();
 }
+async function finderControl(action){
+  if(action === 'start' && !confirm('Запустить поиск IP?')) return;
+  if(action === 'auto_toggle'){
+    const enabled = document.getElementById('autoModeBtn').dataset.enabled === '1';
+    const text = enabled ? 'Выключить полный авто-режим?' : 'Включить полный авто-режим? Он будет сам искать IP, запускать серверы и продолжать цикл после проверок.';
+    if(!confirm(text)) return;
+  }
+  const r = await fetch('/dashboard/api/finder_control', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({action})});
+  const data = await r.json().catch(()=>({ok:false,error:'bad json'}));
+  if(!r.ok || !data.ok){ alert('Ошибка: ' + (data.error || r.status)); return; }
+  const result = data.result || {};
+  document.getElementById('finderActionResult').textContent = result.message || (result.enabled ? 'Авто-режим включен' : 'Готово');
+  await load();
+}
 async function bulkAction(action){
   const payload = {action, limit:100};
   if(action === 'mark_region_provision_failed') payload.region = document.getElementById('bulkRegion').value;
@@ -2893,6 +3042,13 @@ async function load(){
   document.getElementById('updated').textContent = 'обновлено: ' + new Date(d.generated_at*1000).toLocaleString();
   document.getElementById('finderState').innerHTML = d.finder.running ? '<span class="ok">работает</span>' : '<span class="warn">стоп</span>';
   document.getElementById('finderMeta').textContent = 'регион: ' + (d.finder.current_region || '-') + ', попытка: ' + d.finder.current_attempt;
+  const c = d.control || {};
+  document.getElementById('finderStartBtn').disabled = !!d.finder.running || !!c.full_auto_mode;
+  document.getElementById('finderStopBtn').disabled = !d.finder.running && !c.full_auto_mode;
+  const autoBtn = document.getElementById('autoModeBtn');
+  autoBtn.dataset.enabled = c.full_auto_mode ? '1' : '0';
+  autoBtn.textContent = c.full_auto_mode ? 'Выключить авто' : 'Включить авто';
+  autoBtn.className = c.full_auto_mode ? 'danger' : 'secondary';
   document.getElementById('approved').textContent = d.counts.approved;
   document.getElementById('target').textContent = 'цель: ' + d.counts.target + ', кандидаты: ' + d.counts.candidates + ', ban: ' + d.counts.banned;
   const q = d.queue || {}; const total = (q.queued||0)+(q.testing||0)+(q.provisioning||0);
@@ -2900,8 +3056,7 @@ async function load(){
   document.getElementById('queueMeta').textContent = `queued=${q.queued||0}, testing=${q.testing||0}, provisioning=${q.provisioning||0}, approved=${q.approved||0}, ip_not_suitable=${q.ip_not_suitable_total||0}, vless_failed=${q.vless_failed||0}, exit_mismatch=${q.exit_ip_mismatch||0}, phone_failed=${q.phone_failed||0}, provision_failed=${q.provision_failed||0}, banned=${q.manual_banned||0}`;
   document.getElementById('workersTotal').textContent = (d.workers||[]).length;
   document.getElementById('workersMeta').textContent = (d.workers||[]).filter(w=>w.online).length + ' online';
-  const c = d.control || {};
-  document.getElementById('state').innerHTML = `<p>Testing: <b class="${c.testing_paused?'warn':'ok'}">${c.testing_paused?'paused':'running'}</b></p><p>Provisioning: <b class="${c.provisioning_paused?'warn':'ok'}">${esc(d.provisioning.state)}${c.provisioning_paused?' / paused':''}</b></p><p>Последний IP: <code>${esc(d.finder.last_ip || '-')}</code></p><p>Последняя ошибка: <span class="bad">${esc(d.finder.last_error || '-')}</span></p><p>Регионы: ${esc((d.finder.selected_regions||[]).join(', '))}</p>`;
+  document.getElementById('state').innerHTML = `<p>Auto: <b class="${c.full_auto_mode?'ok':'warn'}">${c.full_auto_mode?'enabled':'off'}</b></p><p>Testing: <b class="${c.testing_paused?'warn':'ok'}">${c.testing_paused?'paused':'running'}</b></p><p>Provisioning: <b class="${c.provisioning_paused?'warn':'ok'}">${esc(d.provisioning.state)}${c.provisioning_paused?' / paused':''}</b></p><p>Последний IP: <code>${esc(d.finder.last_ip || '-')}</code></p><p>Последняя ошибка: <span class="bad">${esc(d.finder.last_error || '-')}</span></p><p>Регионы: ${esc((d.finder.selected_regions||[]).join(', '))}</p>`;
   const workers = d.workers || [];
   const regionSelect = document.getElementById('bulkRegion');
   const currentRegion = regionSelect.value;
@@ -3214,6 +3369,34 @@ class TesterAPIHandler(BaseHTTPRequestHandler):
                 self._send_json(400, {"ok": False, "error": str(e)})
             return
 
+        if parsed.path == "/dashboard/api/finder_control":
+            if not self._require_dashboard_auth():
+                return
+            try:
+                payload = self._read_json()
+                action = (payload.get("action") or "").strip().lower()
+                if action == "start":
+                    result = start_finder(actor=DASHBOARD_USERNAME)
+                elif action == "stop":
+                    result = stop_finder(actor=DASHBOARD_USERNAME)
+                elif action == "auto_on":
+                    result = enable_full_auto_mode(actor=DASHBOARD_USERNAME)
+                elif action == "auto_off":
+                    result = disable_full_auto_mode(actor=DASHBOARD_USERNAME)
+                elif action == "auto_toggle":
+                    result = (
+                        disable_full_auto_mode(actor=DASHBOARD_USERNAME)
+                        if is_full_auto_mode_enabled()
+                        else enable_full_auto_mode(actor=DASHBOARD_USERNAME)
+                    )
+                else:
+                    raise RuntimeError("unknown finder action")
+                self._send_json(200, {"ok": True, "result": result, "snapshot": dashboard_snapshot()})
+            except Exception as e:
+                print(f"[dashboard] finder control error: {e}", flush=True)
+                self._send_json(400, {"ok": False, "error": str(e)})
+            return
+
         if parsed.path == "/dashboard/api/action":
             if not self._require_dashboard_auth():
                 return
@@ -3260,7 +3443,8 @@ class TesterAPIHandler(BaseHTTPRequestHandler):
                 raise RuntimeError("results must be a list")
             saved = [complete_vless_test_result(item, worker=worker) for item in results]
             save_worker_heartbeat({"worker": worker, "api_ok": True, "control_ok": True, "current_task": "", "last_error": "", "log_tail": ""}, worker=worker)
-            self._send_json(200, {"ok": True, "saved": saved, "stats": get_vless_queue_stats()})
+            auto = auto_mode_tick(reason="tester_results")
+            self._send_json(200, {"ok": True, "saved": saved, "stats": get_vless_queue_stats(), "auto": auto})
         except Exception as e:
             print(f"[tester-api] POST /results error: {e}", flush=True)
             self._send_json(400, {"ok": False, "error": str(e)})
@@ -3807,6 +3991,7 @@ def provisioning_worker(records: list[GoodIpRecord]):
     finally:
         with provisioning_lock:
             provisioning_running = False
+        auto_mode_tick(reason="provisioning_finished")
 
 
 def start_provisioning_if_needed(networks=None):
@@ -3863,6 +4048,97 @@ def start_provisioning_if_needed(networks=None):
 
     thread = threading.Thread(target=provisioning_worker, args=(records,), daemon=True)
     thread.start()
+
+
+def active_vless_queue_count(stats: dict | None = None) -> int:
+    stats = stats or get_vless_queue_stats()
+    return sum(int(stats.get(status, 0) or 0) for status in ACTIVE_VLESS_STATUSES)
+
+
+def auto_mode_tick(reason: str = "") -> dict:
+    if not is_full_auto_mode_enabled():
+        return {"ok": True, "auto_mode": False, "action": "idle"}
+
+    try:
+        if running:
+            return {"ok": True, "auto_mode": True, "action": "idle", "reason": "finder_running"}
+
+        with provisioning_lock:
+            if provisioning_running:
+                return {"ok": True, "auto_mode": True, "action": "idle", "reason": "provisioning_running"}
+
+        stats = get_vless_queue_stats()
+        active_tests = active_vless_queue_count(stats)
+        if active_tests:
+            return {
+                "ok": True,
+                "auto_mode": True,
+                "action": "idle",
+                "reason": "tests_active",
+                "active_tests": active_tests,
+            }
+
+        slots_left = remaining_slots()
+        if slots_left <= 0:
+            return {"ok": True, "auto_mode": True, "action": "idle", "reason": "target_ready"}
+
+        networks = load_whitelist()
+        candidates = count_matching_good_ips(networks, exclude_approved=True)
+        if candidates >= slots_left and candidates > 0:
+            send(
+                TELEGRAM_ALLOWED_CHAT_ID,
+                "🤖 Авто-режим: кандидаты набраны, запускаю создание серверов\n"
+                f"📦 Кандидатов: {candidates}/{slots_left}\n"
+                f"Причина: {reason or '-'}",
+            )
+            audit_log(
+                "auto_start_provisioning",
+                "",
+                {"reason": reason, "candidates": candidates, "slots_left": slots_left},
+                actor="auto",
+            )
+            start_provisioning_if_needed(networks)
+            return {
+                "ok": True,
+                "auto_mode": True,
+                "action": "start_provisioning",
+                "candidates": candidates,
+                "slots_left": slots_left,
+            }
+
+        result = start_finder(actor="auto")
+        if result.get("status") == "candidates_ready":
+            send(
+                TELEGRAM_ALLOWED_CHAT_ID,
+                "🤖 Авто-режим: кандидаты уже готовы, запускаю создание серверов",
+            )
+            start_provisioning_if_needed(networks)
+            return {"ok": True, "auto_mode": True, "action": "start_provisioning", "finder": result}
+
+        if result.get("started"):
+            send(TELEGRAM_ALLOWED_CHAT_ID, f"🤖 Авто-режим: запускаю новый поиск\n{result.get('message', '')}")
+
+        return {"ok": True, "auto_mode": True, "action": "start_finder", "finder": result}
+    except Exception as e:
+        error = str(e)
+        update_finder_state(last_error=f"auto_mode: {error}")
+        print(f"⚠️ Auto mode tick failed: {error}", flush=True)
+        send(TELEGRAM_ALLOWED_CHAT_ID, f"⚠️ Авто-режим не смог продолжить цикл: {error}")
+        return {"ok": False, "auto_mode": True, "action": "error", "error": error}
+
+
+def enable_full_auto_mode(actor: str = "dashboard") -> dict:
+    set_full_auto_mode(True)
+    resume_all_testing()
+    audit_log("full_auto_on", "", {}, actor=actor)
+    tick = auto_mode_tick(reason=f"{actor}_enabled")
+    return {"ok": True, "enabled": True, "tick": tick}
+
+
+def disable_full_auto_mode(actor: str = "dashboard") -> dict:
+    set_full_auto_mode(False)
+    audit_log("full_auto_off", "", {}, actor=actor)
+    return {"ok": True, "enabled": False}
 
 
 # =========================
@@ -3925,14 +4201,24 @@ def finder_loop():
                     flush=True,
                 )
                 running = False
-                send(
-                    TELEGRAM_ALLOWED_CHAT_ID,
-                    "🎯 Кандидаты для свободных слотов найдены\n"
-                    f"✅ Принято ключей: {approved_count()}/{target_count()}\n"
-                    f"📦 Новых кандидатов: {current_count}/{slots_left}\n\n"
-                    "Finder остановлен. Серверы еще НЕ созданы.",
-                    reply_markup=create_servers_keyboard(),
-                )
+                if is_full_auto_mode_enabled():
+                    send(
+                        TELEGRAM_ALLOWED_CHAT_ID,
+                        "🤖 Авто-режим: кандидаты для свободных слотов найдены\n"
+                        f"✅ Принято ключей: {approved_count()}/{target_count()}\n"
+                        f"📦 Новых кандидатов: {current_count}/{slots_left}\n\n"
+                        "Finder остановлен. Запускаю создание серверов.",
+                    )
+                    start_provisioning_if_needed(whitelist)
+                else:
+                    send(
+                        TELEGRAM_ALLOWED_CHAT_ID,
+                        "🎯 Кандидаты для свободных слотов найдены\n"
+                        f"✅ Принято ключей: {approved_count()}/{target_count()}\n"
+                        f"📦 Новых кандидатов: {current_count}/{slots_left}\n\n"
+                        "Finder остановлен. Серверы еще НЕ созданы.",
+                        reply_markup=create_servers_keyboard(),
+                    )
                 time.sleep(5)
                 continue
 

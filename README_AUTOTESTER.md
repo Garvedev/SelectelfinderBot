@@ -35,7 +35,8 @@ Redmi A9 / Termux
 - `run_single_vless_test()` больше не ждет кнопки `Работает/Не работает`: он создает сервер и кладет VLESS в очередь.
 - Ошибка телефона больше не банит IP автоматически. IP получает статус `phone_failed` и ждет ручного решения в dashboard.
 - Ошибка создания сервера, cloud-init, TCP/443 или provisioning получает статус `provision_failed` и тоже ждет ручного решения.
-- Dashboard показывает кнопки `Повторить` и `Удалить IP` для `phone_failed`, `provision_failed`, `rejected`, `error`.
+- Dashboard показывает кнопки `Повторить` и `Удалить IP` для fail/review-статусов: `ip_not_suitable`, `vless_failed`, `exit_ip_mismatch`, `phone_failed`, `provision_failed`, `rejected`, `error`.
+- Dashboard также умеет запускать/останавливать Finder и включать полный авто-режим.
 
 ## Безопасные статусы
 
@@ -45,13 +46,16 @@ testing             задача выдана телефону
 provisioning        идет ручной retry provisioning
 approved            телефон подтвердил ключ
 phone_failed        телефон не подтвердил ключ, IP НЕ забанен
+ip_not_suitable     телефон не смог напрямую открыть TCP/443 к candidate IP
+vless_failed        TCP есть, но VLESS/REALITY/curl через test proxy не прошел
+exit_ip_mismatch    VLESS работает, но exit IP не совпал с выбранной политикой
 provision_failed    сервер/VLESS/TCP/443 не подготовились, IP НЕ забанен
 manual_banned       IP удален и забанен вручную через dashboard
 rejected            legacy-статус старых записей
 error               внутренняя ошибка, требуется ручное решение
 ```
 
-`phone_failed` и `provision_failed` не возвращаются в очередь автоматически. Повторная проверка делается только вручную через dashboard.
+Fail-статусы (`phone_failed`, `ip_not_suitable`, `vless_failed`, `exit_ip_mismatch`, `provision_failed`) не возвращаются в очередь автоматически. Повторная проверка делается вручную через dashboard.
 
 ## Настройки VPS `.env`
 
@@ -101,6 +105,7 @@ curl http://127.0.0.1:8787/health
   "ok": true,
   "testing_paused": false,
   "provisioning_paused": false,
+  "full_auto_mode": false,
   "stats": {}
 }
 ```
@@ -135,6 +140,29 @@ Dashboard доступен по адресу:
 http://YOUR_VPS_IP:8787/dashboard
 ```
 
+В карточке `Finder` есть кнопки:
+
+```text
+Старт
+Стоп
+Включить авто / Выключить авто
+```
+
+`Старт` и `Стоп` запускают и останавливают тот же поиск IP, что команды `/start` и `/stop` в Telegram.
+
+`Включить авто` запускает полный цикл: поиск IP -> создание серверов -> проверка телефоном -> новый поиск, пока не будет нажата кнопка `Стоп` или `Выключить авто`. При включении авто-режима выдача задач телефону и создание серверов снимаются с паузы.
+
+Bulk-действия в dashboard:
+
+```text
+Удалить все IP не подходят
+Retry все vless_failed
+Регион в provision_failed
+Удалить старые provision_failed
+Reconcile dry-run
+Cleanup stale temp servers
+```
+
 Для проблемных IP появляются кнопки:
 
 ```text
@@ -155,7 +183,7 @@ provision_failed/error/rejected -> запускает повторное соз�
 - best-effort cleanup server;
 - удаляет Floating IP в Selectel;
 - удаляет IP из good_ips.txt;
-- добавляет IP в banned_ips.txt;
+- добавляет подсеть IP в banned_ips.txt, например 139.100.193.0/24;
 - переводит запись в manual_banned.
 ```
 
@@ -181,6 +209,23 @@ termux-wake-lock
 python ~/selectel-tester/termux_vless_tester.py
 ```
 
+Дополнительные переменные Termux worker:
+
+```bash
+export TESTER_WORK_DIR="$HOME/selectel-tester"
+export CONTROL_PROXY_PORT=20808
+export TEST_PROXY_PORT=20809
+export TESTER_BATCH_SIZE=11
+export POLL_SLEEP=10
+export HEARTBEAT_INTERVAL=30
+export SINGBOX_STARTUP_WAIT=2.5
+export CURL_TIMEOUT=20
+export TEST_URL="https://api.ipify.org"
+export DIRECT_TEST_URL="$TEST_URL"
+```
+
+Если результат не удалось отправить на VPS, worker складывает его в `pending_results.jsonl` внутри `TESTER_WORK_DIR` и пробует отправить позже.
+
 ## Важная логика для белых списков
 
 Телефон не пытается переключать весь Android с одного ключа на другой.
@@ -196,13 +241,17 @@ python ~/selectel-tester/termux_vless_tester.py
 
 ## Критерий успеха
 
-Кандидат считается рабочим, только если:
+Кандидат считается рабочим, если curl через test proxy успешно вернул внешний IP и результат проходит политику `TESTER_EXPECT_EXIT_IP`.
 
 ```text
-curl через test proxy вернул внешний IP, совпадающий с Floating IP кандидата
+any        принять любой непустой exit IP через test VLESS
+candidate  требовать, чтобы exit IP совпал с Floating IP кандидата
+exact      требовать, чтобы exit IP совпал с EXPECTED_EXIT_IP
 ```
 
-Если результат не совпал, был timeout или sing-box не запустился — задача получает `phone_failed`, но IP не банится автоматически.
+Для текущего frontend/forwarding-сценария рекомендуется `TESTER_EXPECT_EXIT_IP=any`.
+
+Если результат не проходит политику, был timeout или sing-box не запустился — задача получает fail-статус, но IP не банится автоматически.
 
 ## Диагностика
 
