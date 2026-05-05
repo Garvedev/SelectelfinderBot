@@ -693,6 +693,9 @@ class PendingVlessTest:
 
 def save_managed_list(name: str, content: str, actor: str = "dashboard") -> dict:
     result = save_managed_list_file(name, content)
+    if result["name"] == "ipwhitelist_safe_cidr.txt":
+        with settings_lock:
+            bump_settings_version()
     audit_log("list_update", result["name"], {"bytes": result["bytes"], "lines": result["lines"]}, actor=actor)
     return result
 

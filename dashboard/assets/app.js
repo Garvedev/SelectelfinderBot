@@ -54,7 +54,7 @@ const state = {
   tests: [],
   settings: [],
   currentTab: "overview",
-  currentList: "approved_vless_keys.txt",
+  currentList: "ipwhitelist_safe_cidr.txt",
 };
 
 function esc(value) {

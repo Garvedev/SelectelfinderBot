@@ -8,6 +8,7 @@
 
 - Искать Floating IP в выбранных регионах Selectel и сверять их с `ipwhitelist_safe_cidr.txt`.
 - Вести локальные списки:
+  - `ipwhitelist_safe_cidr.txt` - целевые IP/CIDR для поиска;
   - `good_ips.txt` - найденные IP-кандидаты;
   - `approved_vless_keys.txt` - подтвержденные рабочие VLESS-ключи;
   - `banned_ips.txt` - забаненные IP/подсети.
@@ -189,6 +190,7 @@ http://HOST:8787/dashboard
 - `Обзор` - состояние поиска, метрики, телефон, журнал действий.
 - `Активные проверки` - только активные VLESS-задачи: `queued`, `testing`, `provisioning`. В таблице показывается собранный VLESS-ключ, его можно скопировать и проверить вручную.
 - `Списки` - просмотр, редактирование, сохранение, загрузка и скачивание:
+  - `ipwhitelist_safe_cidr.txt`;
   - `approved_vless_keys.txt`;
   - `good_ips.txt`;
   - `banned_ips.txt`.

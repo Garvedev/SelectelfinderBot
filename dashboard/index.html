@@ -138,13 +138,14 @@
           </div>
           <div class="toolbar">
             <select id="listName">
+              <option value="ipwhitelist_safe_cidr.txt">ipwhitelist_safe_cidr.txt</option>
               <option value="approved_vless_keys.txt">approved_vless_keys.txt</option>
               <option value="good_ips.txt">good_ips.txt</option>
               <option value="banned_ips.txt">banned_ips.txt</option>
             </select>
             <button id="listOpenBtn" class="secondary">Открыть</button>
             <button id="listSaveBtn">Сохранить</button>
-            <a id="listDownloadBtn" class="button secondary" href="/dashboard/api/list_download?name=approved_vless_keys.txt">Скачать</a>
+            <a id="listDownloadBtn" class="button secondary" href="/dashboard/api/list_download?name=ipwhitelist_safe_cidr.txt">Скачать</a>
             <label class="file-button">Загрузить файл<input id="listUpload" type="file" accept=".txt,text/plain"></label>
           </div>
           <textarea id="listEditor" spellcheck="false"></textarea>

@@ -7,6 +7,7 @@ BASE_DIR = Path(__file__).resolve().parent
 GOOD_IPS_FILE = BASE_DIR / "good_ips.txt"
 BANNED_IPS_FILE = BASE_DIR / "banned_ips.txt"
 APPROVED_KEYS_FILE = BASE_DIR / "approved_vless_keys.txt"
+WHITELIST_FILE = BASE_DIR / "ipwhitelist_safe_cidr.txt"
 BANNED_IPV4_PREFIX = 24
 MANAGED_LIST_MAX_BYTES = 2 * 1024 * 1024
 
@@ -187,6 +188,11 @@ def load_approved_region_counts() -> dict[str, int]:
 
 
 MANAGED_LIST_FILES = {
+    "ipwhitelist_safe_cidr.txt": {
+        "path": WHITELIST_FILE,
+        "title": "Whitelist задач поиска",
+        "description": "Целевые IP/CIDR для поиска Floating IP",
+    },
     "approved_vless_keys.txt": {
         "path": APPROVED_KEYS_FILE,
         "title": "Рабочие VLESS-ключи",
@@ -244,6 +250,10 @@ def validate_managed_list_content(name: str, content: str):
             elif name == "banned_ips.txt":
                 if not parse_banned_network(parts[0]):
                     raise ValueError("ожидается IP или CIDR")
+            elif name == "ipwhitelist_safe_cidr.txt":
+                tokens = [token for token in stripped.split("#", 1)[0].replace(",", " ").replace(";", " ").split() if token]
+                for token in tokens:
+                    ipaddress.ip_network(token, strict=False)
         except ValueError as exc:
             errors.append(f"строка {line_no}: {exc}")
             if len(errors) >= 8:
