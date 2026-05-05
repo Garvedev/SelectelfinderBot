@@ -235,13 +235,34 @@ setup_file_logging()
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
 
+SENSITIVE_ENV_NAMES = [
+    "TELEGRAM_BOT_TOKEN",
+    "TESTER_TOKEN",
+    "CONTROL_VLESS",
+    "OS_PASSWORD",
+    "DASHBOARD_PASSWORD",
+    "PROVISION_VLESS_TEMPLATE",
+]
+
+
+def redact_text(value) -> str:
+    text = str(value or "")
+    for name in SENSITIVE_ENV_NAMES:
+        secret = os.getenv(name, "").strip()
+        if secret and len(secret) >= 4:
+            text = text.replace(secret, f"[REDACTED:{name}]")
+    text = re.sub(r"vless://\S+", "vless://[REDACTED]", text)
+    text = re.sub(r"(?i)(token|password|passwd|secret)=([^&\s]+)", r"\1=[REDACTED]", text)
+    return text
+
+
 def allowed(message) -> bool:
     return str(message.chat.id) == str(TELEGRAM_ALLOWED_CHAT_ID)
 
 
 def send(chat_id, text, reply_markup=None):
     try:
-        bot.send_message(chat_id, text, reply_markup=reply_markup)
+        bot.send_message(chat_id, redact_text(text), reply_markup=reply_markup)
     except Exception as e:
         print(f"Telegram send error: {e}", flush=True)
 
@@ -259,6 +280,13 @@ def get_settings_version() -> int:
 
 
 def get_selected_regions() -> list[str]:
+    try:
+        regions = get_runtime_setting("SELECTED_REGIONS")
+        if regions:
+            return list(regions)
+    except Exception:
+        pass
+
     with settings_lock:
         return selected_regions.copy()
 
@@ -281,6 +309,11 @@ def set_selected_regions(regions: list[str]):
     with settings_lock:
         selected_regions = unique_regions
         bump_settings_version()
+
+    try:
+        set_runtime_setting("SELECTED_REGIONS", unique_regions)
+    except Exception as e:
+        print(f"Failed to persist selected regions: {e}", flush=True)
 
 
 def set_waiting_for_whitelist_file(value: bool):
@@ -377,16 +410,17 @@ def cmd_start(message):
         return
 
     approved, existing_candidates, left_to_find = remaining_ips_to_find(networks)
-    if approved >= TARGET_COUNT:
-        bot.reply_to(message, f"✅ Уже есть {approved}/{TARGET_COUNT} рабочих ключей. Добор не нужен.")
+    current_target = target_count()
+    if approved >= current_target:
+        bot.reply_to(message, f"✅ Уже есть {approved}/{current_target} рабочих ключей. Добор не нужен.")
         return
 
     if left_to_find <= 0:
         bot.reply_to(
             message,
             "✅ Кандидаты уже набраны. Поиск не нужен.\n"
-            f"✅ Принято ключей: {approved}/{TARGET_COUNT}\n"
-            f"📦 Найдено кандидатов: {existing_candidates}/{TARGET_COUNT - approved}\n\n"
+            f"✅ Принято ключей: {approved}/{current_target}\n"
+            f"📦 Найдено кандидатов: {existing_candidates}/{current_target - approved}\n\n"
             "Чтобы создать серверы и выдать ключи, нажми /create_servers.",
             reply_markup=create_servers_keyboard(),
         )
@@ -403,8 +437,8 @@ def cmd_start(message):
         message,
         "🚀 Поиск IP запущен\n"
         f"🎯 Целей: {len(networks)}\n"
-        f"✅ Принято ключей: {approved}/{TARGET_COUNT}\n"
-        f"📦 Уже найдено кандидатов: {existing_candidates}/{TARGET_COUNT - approved}\n"
+        f"✅ Принято ключей: {approved}/{current_target}\n"
+        f"📦 Уже найдено кандидатов: {existing_candidates}/{current_target - approved}\n"
         f"🔎 Осталось найти IP: {left_to_find}\n"
         f"🌍 Регионы: {format_regions()}",
     )
@@ -436,7 +470,8 @@ def cmd_status(message):
         whitelist_status = f"ошибка: {e}"
 
     approved = approved_count()
-    slots_left = max(TARGET_COUNT - approved, 0)
+    current_target = target_count()
+    slots_left = max(current_target - approved, 0)
     count = sync_good_ips(networks, exclude_approved=True)
     left_to_find = max(slots_left - count, 0)
     state = "работает" if running else "остановлен"
@@ -460,7 +495,7 @@ def cmd_status(message):
         f"🌐 Последний IP: {fs.get('last_ip') or '-'}\n"
         f"⚠️ Последняя ошибка: {fs.get('last_error') or '-'}\n"
         f"🕒 Запущен: {fs.get('started_at') or '-'}\n"
-        f"✅ Принято ключей: {approved}/{TARGET_COUNT}\n"
+        f"✅ Принято ключей: {approved}/{current_target}\n"
         f"📦 Найдено кандидатов: {count}/{slots_left}\n"
         f"🔎 Осталось найти IP: {left_to_find}\n"
         f"🎯 Целей в файле: {whitelist_status}\n"
@@ -487,7 +522,7 @@ def cmd_test_status(message):
         "📲 Авто-тестер VLESS",
         f"API: {api_state}",
         f"Адрес: {TESTER_API_HOST}:{TESTER_API_PORT}",
-        f"batch: {TESTER_BATCH_SIZE}",
+        f"batch: {tester_batch_size()}",
         f"выдача задач телефону: {'paused ⏸' if control['testing_paused'] else 'running ▶️'}",
         f"создание серверов: {'paused ⏸' if control['provisioning_paused'] else 'running ▶️'}",
         "",
@@ -496,7 +531,7 @@ def cmd_test_status(message):
         f"testing: {stats.get('testing', 0)}",
         f"provisioning: {stats.get('provisioning', 0)}",
         f"approved: {stats.get('approved', 0)}",
-        f"phone_tcp_unreachable: {stats.get('phone_tcp_unreachable', 0)}",
+        f"ip_not_suitable: {stats.get('ip_not_suitable_total', 0)}",
         f"vless_failed: {stats.get('vless_failed', 0)}",
         f"exit_ip_mismatch: {stats.get('exit_ip_mismatch', 0)}",
         f"phone_failed: {stats.get('phone_failed', 0)}",
@@ -631,7 +666,7 @@ def cmd_sync(message):
     bot.reply_to(
         message,
         "🔄 Синхронизация завершена.\n"
-        f"✅ Принято ключей: {approved_count()}/{TARGET_COUNT}\n"
+        f"✅ Принято ключей: {approved_count()}/{target_count()}\n"
         f"📦 Новых кандидатов: {count}/{remaining_slots()}",
     )
 
@@ -1033,7 +1068,7 @@ def approved_count() -> int:
 
 def remaining_slots() -> int:
     """How many approved keys are still needed to reach TARGET_COUNT."""
-    return max(TARGET_COUNT - approved_count(), 0)
+    return max(target_count() - approved_count(), 0)
 
 
 def remaining_ips_to_find(networks=None) -> tuple[int, int, int]:
@@ -1045,7 +1080,7 @@ def remaining_ips_to_find(networks=None) -> tuple[int, int, int]:
     """
     approved = approved_count()
     candidates = count_matching_good_ips(networks, exclude_approved=True)
-    left_to_find = max(TARGET_COUNT - approved - candidates, 0)
+    left_to_find = max(target_count() - approved - candidates, 0)
     return approved, candidates, left_to_find
 
 
@@ -1254,7 +1289,8 @@ def matching_good_ip_records(networks=None, exclude_approved=False) -> list[Good
 # VLESS AUTO-TEST QUEUE / API
 # =========================
 
-PHONE_FAILURE_STATUSES = {"phone_tcp_unreachable", "vless_failed", "exit_ip_mismatch", "phone_failed"}
+IP_NOT_SUITABLE_STATUSES = {"ip_not_suitable", "phone_tcp_unreachable"}
+PHONE_FAILURE_STATUSES = {"ip_not_suitable", "phone_tcp_unreachable", "vless_failed", "exit_ip_mismatch", "phone_failed"}
 FINAL_VLESS_STATUSES = {"approved", "provision_failed", "manual_banned", "deleted", "rejected", "error", *PHONE_FAILURE_STATUSES}
 ACTIVE_VLESS_STATUSES = {"queued", "testing", "provisioning"}
 REVIEW_VLESS_STATUSES = {"provision_failed", "error", "rejected", *PHONE_FAILURE_STATUSES}
@@ -1326,6 +1362,19 @@ def init_vless_queue():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dashboard_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at INTEGER NOT NULL,
+                actor TEXT NOT NULL,
+                action TEXT NOT NULL,
+                target TEXT,
+                details TEXT
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_dashboard_audit_created ON dashboard_audit(created_at)")
         for key, value in CONTROL_DEFAULTS.items():
             conn.execute(
                 """
@@ -1381,12 +1430,479 @@ def get_tester_control_state() -> dict:
     }
 
 
+def audit_log(action: str, target: str = "", details: dict | None = None, actor: str = "dashboard"):
+    try:
+        init_vless_queue()
+        details_text = json.dumps(details or {}, ensure_ascii=False, sort_keys=True)
+        with vless_queue_lock, get_vless_queue_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO dashboard_audit(created_at, actor, action, target, details)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    now_ts(),
+                    redact_text(actor)[:80],
+                    redact_text(action)[:120],
+                    redact_text(target)[:200],
+                    redact_text(details_text)[:4000],
+                ),
+            )
+    except Exception as e:
+        print(f"Audit log error: {e}", flush=True)
+
+
+def get_audit_events(limit: int = 30) -> list[dict]:
+    init_vless_queue()
+    limit = max(1, min(int(limit or 30), 200))
+    with vless_queue_lock, get_vless_queue_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, created_at, actor, action, target, details
+            FROM dashboard_audit
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    events = []
+    for row in rows:
+        item = dict(row)
+        item["details"] = redact_text(item.get("details") or "")
+        events.append(item)
+    return events
+
+
+RUNTIME_SETTING_PREFIX = "setting:"
+RUNTIME_SETTING_SPECS = [
+    {
+        "key": "TARGET_COUNT",
+        "group": "Finder",
+        "label": "Цель approved ключей",
+        "kind": "int",
+        "default": TARGET_COUNT,
+        "min": 1,
+        "max": 200,
+    },
+    {
+        "key": "SELECTED_REGIONS",
+        "group": "Finder",
+        "label": "Регионы поиска",
+        "kind": "regions",
+        "default": REGIONS,
+        "choices": REGIONS,
+    },
+    {
+        "key": "GOOD_IP_SYNC_INTERVAL",
+        "group": "Finder",
+        "label": "Интервал sync good IP, сек",
+        "kind": "int",
+        "default": GOOD_IP_SYNC_INTERVAL,
+        "min": 10,
+        "max": 86400,
+    },
+    {
+        "key": "PROVISION_PREEMPTIBLE_REGIONS",
+        "group": "Provisioning",
+        "label": "Preemptible регионы",
+        "kind": "regions",
+        "default": PROVISION_PREEMPTIBLE_REGIONS,
+        "choices": DEFAULT_REGIONS,
+    },
+    {
+        "key": "PROVISION_ALLOW_NON_PREEMPTIBLE",
+        "group": "Provisioning",
+        "label": "Разрешить обычные серверы",
+        "kind": "bool",
+        "default": PROVISION_ALLOW_NON_PREEMPTIBLE,
+    },
+    {
+        "key": "PROVISION_SETUP_WAIT_SECONDS",
+        "group": "Provisioning",
+        "label": "Ожидание cloud-init/forwarding, сек",
+        "kind": "int",
+        "default": PROVISION_SETUP_WAIT_SECONDS,
+        "min": 0,
+        "max": 3600,
+    },
+    {
+        "key": "PROVISION_SERVER_WAIT_SECONDS",
+        "group": "Provisioning",
+        "label": "Ожидание создания сервера, сек",
+        "kind": "int",
+        "default": PROVISION_SERVER_WAIT_SECONDS,
+        "min": 30,
+        "max": 3600,
+    },
+    {
+        "key": "PROVISION_MAX_FLAVOR_ATTEMPTS",
+        "group": "Provisioning",
+        "label": "Максимум flavor попыток",
+        "kind": "int",
+        "default": PROVISION_MAX_FLAVOR_ATTEMPTS,
+        "min": 1,
+        "max": 100,
+    },
+    {
+        "key": "PROVISION_TCP_CHECK_ENABLED",
+        "group": "TCP check",
+        "label": "Проверять TCP/443 с VPS",
+        "kind": "bool",
+        "default": PROVISION_TCP_CHECK_ENABLED,
+    },
+    {
+        "key": "PROVISION_TCP_CHECK_TIMEOUT",
+        "group": "TCP check",
+        "label": "TCP timeout, сек",
+        "kind": "int",
+        "default": PROVISION_TCP_CHECK_TIMEOUT,
+        "min": 1,
+        "max": 120,
+    },
+    {
+        "key": "PROVISION_TCP_CHECK_RETRIES",
+        "group": "TCP check",
+        "label": "TCP retries",
+        "kind": "int",
+        "default": PROVISION_TCP_CHECK_RETRIES,
+        "min": 1,
+        "max": 300,
+    },
+    {
+        "key": "PROVISION_DELETE_SERVER_AFTER_RESULT",
+        "group": "Cleanup",
+        "label": "Удалять временный сервер после результата",
+        "kind": "bool",
+        "default": PROVISION_DELETE_SERVER_AFTER_RESULT,
+    },
+    {
+        "key": "PROVISION_DELETE_FAILED_FLOATING_IP",
+        "group": "Cleanup",
+        "label": "Удалять Floating IP при failed provisioning",
+        "kind": "bool",
+        "default": PROVISION_DELETE_FAILED_FLOATING_IP,
+    },
+    {
+        "key": "TESTER_BATCH_SIZE",
+        "group": "Phone worker",
+        "label": "Размер пачки задач",
+        "kind": "int",
+        "default": TESTER_BATCH_SIZE,
+        "min": 1,
+        "max": 100,
+    },
+    {
+        "key": "TESTER_LEASE_SECONDS",
+        "group": "Phone worker",
+        "label": "Lease задачи, сек",
+        "kind": "int",
+        "default": TESTER_LEASE_SECONDS,
+        "min": 30,
+        "max": 86400,
+    },
+    {
+        "key": "TESTER_MAX_ATTEMPTS",
+        "group": "Phone worker",
+        "label": "Максимум попыток worker",
+        "kind": "int",
+        "default": TESTER_MAX_ATTEMPTS,
+        "min": 1,
+        "max": 20,
+    },
+]
+RUNTIME_SETTING_BY_KEY = {spec["key"]: spec for spec in RUNTIME_SETTING_SPECS}
+
+
+def setting_default_value(spec: dict):
+    value = spec["default"]
+    if spec["kind"] == "regions":
+        return list(value)
+    return value
+
+
+def normalize_bool_setting(value) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    raw = str(value).strip().lower()
+    if raw in {"1", "true", "yes", "y", "on"}:
+        return "true"
+    if raw in {"0", "false", "no", "n", "off"}:
+        return "false"
+    raise RuntimeError("value must be true or false")
+
+
+def normalize_int_setting(spec: dict, value) -> str:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("value must be an integer") from exc
+    minimum = int(spec.get("min", 0))
+    maximum = int(spec.get("max", 10**9))
+    if parsed < minimum or parsed > maximum:
+        raise RuntimeError(f"value must be between {minimum} and {maximum}")
+    return str(parsed)
+
+
+def normalize_regions_setting(spec: dict, value) -> str:
+    if isinstance(value, str):
+        regions = [item.strip() for item in value.split(",") if item.strip()]
+    elif isinstance(value, list):
+        regions = [str(item).strip() for item in value if str(item).strip()]
+    else:
+        raise RuntimeError("value must be a comma-separated string or list")
+
+    choices = list(spec.get("choices") or DEFAULT_REGIONS)
+    invalid = [region for region in regions if region not in choices]
+    if invalid:
+        raise RuntimeError(f"unknown regions: {', '.join(invalid)}")
+
+    unique = []
+    for region in regions:
+        if region not in unique:
+            unique.append(region)
+    if not unique:
+        raise RuntimeError("at least one region must be selected")
+    return ",".join(unique)
+
+
+def normalize_runtime_setting(key: str, value) -> str:
+    spec = RUNTIME_SETTING_BY_KEY.get(key)
+    if not spec:
+        raise RuntimeError(f"unknown setting: {key}")
+    kind = spec["kind"]
+    if kind == "bool":
+        return normalize_bool_setting(value)
+    if kind == "int":
+        return normalize_int_setting(spec, value)
+    if kind == "regions":
+        return normalize_regions_setting(spec, value)
+    raise RuntimeError(f"unsupported setting kind: {kind}")
+
+
+def parse_runtime_setting(spec: dict, raw: str):
+    if spec["kind"] == "bool":
+        return raw == "true"
+    if spec["kind"] == "int":
+        return int(raw)
+    if spec["kind"] == "regions":
+        return [item.strip() for item in raw.split(",") if item.strip()]
+    return raw
+
+
+def get_runtime_setting_raw(key: str) -> str | None:
+    init_vless_queue()
+    with vless_queue_lock, get_vless_queue_conn() as conn:
+        row = conn.execute(
+            "SELECT value FROM tester_control WHERE key = ?",
+            (RUNTIME_SETTING_PREFIX + key,),
+        ).fetchone()
+    return str(row["value"]) if row else None
+
+
+def get_runtime_setting(key: str):
+    spec = RUNTIME_SETTING_BY_KEY[key]
+    raw = get_runtime_setting_raw(key)
+    if raw is None:
+        return setting_default_value(spec)
+    try:
+        return parse_runtime_setting(spec, raw)
+    except Exception:
+        return setting_default_value(spec)
+
+
+def set_runtime_setting(key: str, value):
+    normalized = normalize_runtime_setting(key, value)
+    set_tester_control_value(RUNTIME_SETTING_PREFIX + key, normalized)
+    if key == "SELECTED_REGIONS":
+        with settings_lock:
+            selected_regions[:] = parse_runtime_setting(RUNTIME_SETTING_BY_KEY[key], normalized)
+            bump_settings_version()
+    return get_runtime_setting(key)
+
+
+def reset_runtime_setting(key: str):
+    if key not in RUNTIME_SETTING_BY_KEY:
+        raise RuntimeError(f"unknown setting: {key}")
+    init_vless_queue()
+    with vless_queue_lock, get_vless_queue_conn() as conn:
+        conn.execute("DELETE FROM tester_control WHERE key = ?", (RUNTIME_SETTING_PREFIX + key,))
+    if key == "SELECTED_REGIONS":
+        with settings_lock:
+            selected_regions[:] = REGIONS.copy()
+            bump_settings_version()
+
+
+def runtime_settings_snapshot() -> list[dict]:
+    items = []
+    for spec in RUNTIME_SETTING_SPECS:
+        key = spec["key"]
+        raw = get_runtime_setting_raw(key)
+        current = get_runtime_setting(key)
+        default = setting_default_value(spec)
+        item = {
+            "key": key,
+            "group": spec["group"],
+            "label": spec["label"],
+            "kind": spec["kind"],
+            "value": current,
+            "default": default,
+            "overridden": raw is not None,
+        }
+        if "min" in spec:
+            item["min"] = spec["min"]
+        if "max" in spec:
+            item["max"] = spec["max"]
+        if "choices" in spec:
+            item["choices"] = spec["choices"]
+        items.append(item)
+    return items
+
+
+RUNTIME_PRESETS = {
+    "safe_ru3_ru7": {
+        "SELECTED_REGIONS": ["ru-3", "ru-7"],
+        "PROVISION_PREEMPTIBLE_REGIONS": ["ru-3", "ru-7"],
+        "PROVISION_ALLOW_NON_PREEMPTIBLE": False,
+        "PROVISION_DELETE_FAILED_FLOATING_IP": False,
+    },
+    "fast_test": {
+        "PROVISION_SETUP_WAIT_SECONDS": 120,
+        "PROVISION_TCP_CHECK_TIMEOUT": 5,
+        "PROVISION_TCP_CHECK_RETRIES": 6,
+        "TESTER_BATCH_SIZE": 11,
+    },
+    "reliable_provisioning": {
+        "PROVISION_SETUP_WAIT_SECONDS": 720,
+        "PROVISION_TCP_CHECK_TIMEOUT": 8,
+        "PROVISION_TCP_CHECK_RETRIES": 30,
+        "TESTER_LEASE_SECONDS": 900,
+    },
+    "keep_failed_ip": {
+        "PROVISION_DELETE_SERVER_AFTER_RESULT": True,
+        "PROVISION_DELETE_FAILED_FLOATING_IP": False,
+    },
+}
+
+
+def apply_runtime_preset(name: str, actor: str = "dashboard") -> dict:
+    values = RUNTIME_PRESETS.get(name)
+    if not values:
+        raise RuntimeError(f"unknown preset: {name}")
+    before = {key: get_runtime_setting(key) for key in values}
+    for key, value in values.items():
+        set_runtime_setting(key, value)
+    after = {key: get_runtime_setting(key) for key in values}
+    audit_log("settings_preset", name, {"before": before, "after": after}, actor=actor)
+    return {"ok": True, "preset": name, "settings": runtime_settings_snapshot()}
+
+
+def update_runtime_settings(payload: dict, actor: str = "dashboard") -> dict:
+    reset_keys = payload.get("reset") or []
+    values = payload.get("values") or {}
+    if not isinstance(reset_keys, list):
+        raise RuntimeError("reset must be a list")
+    if not isinstance(values, dict):
+        raise RuntimeError("values must be an object")
+
+    before = {}
+    touched = [str(key) for key in reset_keys] + [str(key) for key in values]
+    for key in touched:
+        if key in RUNTIME_SETTING_BY_KEY:
+            before[key] = get_runtime_setting(key)
+
+    for key in reset_keys:
+        reset_runtime_setting(str(key))
+    for key, value in values.items():
+        set_runtime_setting(str(key), value)
+
+    after = {key: get_runtime_setting(key) for key in before}
+    if before:
+        audit_log("settings_update", ",".join(before.keys()), {"before": before, "after": after}, actor=actor)
+
+    return {"ok": True, "settings": runtime_settings_snapshot()}
+
+
+def target_count() -> int:
+    return int(get_runtime_setting("TARGET_COUNT"))
+
+
+def good_ip_sync_interval() -> int:
+    return int(get_runtime_setting("GOOD_IP_SYNC_INTERVAL"))
+
+
+def provision_preemptible_regions() -> list[str]:
+    return list(get_runtime_setting("PROVISION_PREEMPTIBLE_REGIONS"))
+
+
+def provision_allow_non_preemptible() -> bool:
+    return bool(get_runtime_setting("PROVISION_ALLOW_NON_PREEMPTIBLE"))
+
+
+def provision_setup_wait_seconds() -> int:
+    return int(get_runtime_setting("PROVISION_SETUP_WAIT_SECONDS"))
+
+
+def provision_server_wait_seconds() -> int:
+    return int(get_runtime_setting("PROVISION_SERVER_WAIT_SECONDS"))
+
+
+def provision_max_flavor_attempts() -> int:
+    return int(get_runtime_setting("PROVISION_MAX_FLAVOR_ATTEMPTS"))
+
+
+def provision_tcp_check_enabled() -> bool:
+    return bool(get_runtime_setting("PROVISION_TCP_CHECK_ENABLED"))
+
+
+def provision_tcp_check_timeout() -> int:
+    return int(get_runtime_setting("PROVISION_TCP_CHECK_TIMEOUT"))
+
+
+def provision_tcp_check_retries() -> int:
+    return int(get_runtime_setting("PROVISION_TCP_CHECK_RETRIES"))
+
+
+def provision_delete_server_after_result() -> bool:
+    return bool(get_runtime_setting("PROVISION_DELETE_SERVER_AFTER_RESULT"))
+
+
+def provision_delete_failed_floating_ip() -> bool:
+    return bool(get_runtime_setting("PROVISION_DELETE_FAILED_FLOATING_IP"))
+
+
+def tester_batch_size() -> int:
+    return int(get_runtime_setting("TESTER_BATCH_SIZE"))
+
+
+def tester_lease_seconds() -> int:
+    return int(get_runtime_setting("TESTER_LEASE_SECONDS"))
+
+
+def tester_max_attempts() -> int:
+    return int(get_runtime_setting("TESTER_MAX_ATTEMPTS"))
+
+
+def region_provision_block_reason(region: str) -> str:
+    return (
+        f"Region {region} is not in PROVISION_PREEMPTIBLE_REGIONS and "
+        "PROVISION_ALLOW_NON_PREEMPTIBLE=false; IP skipped as not provisionable"
+    )
+
+
+def region_can_provision(region: str) -> bool:
+    return region in provision_preemptible_regions() or provision_allow_non_preemptible()
+
+
+def dashboard_settings_snapshot() -> dict:
+    return {"ok": True, "generated_at": now_ts(), "settings": runtime_settings_snapshot()}
+
+
 
 def classify_phone_failure(error: str) -> str:
     """Map worker error strings into actionable review statuses."""
     e = (error or "").strip().lower()
     if e.startswith("phone_tcp_unreachable") or "phone_tcp_unreachable" in e:
-        return "phone_tcp_unreachable"
+        return "ip_not_suitable"
     if e.startswith("exit_ip_mismatch") or "exit_ip_mismatch" in e:
         return "exit_ip_mismatch"
     if e.startswith("vless_failed") or "curl_through_test_proxy_failed" in e or "cannot complete socks5" in e:
@@ -1394,14 +1910,36 @@ def classify_phone_failure(error: str) -> str:
     return "phone_failed"
 
 
-def phone_failure_human_hint(status: str) -> str:
-    if status == "phone_tcp_unreachable":
+def legacy_phone_failure_human_hint(status: str) -> str:
+    if status in IP_NOT_SUITABLE_STATUSES:
         return "телефон не смог напрямую открыть TCP к candidate IP:443; IP не подходит как белый входной IP для этой сети"
     if status == "vless_failed":
         return "TCP до candidate IP есть, но VLESS/REALITY/curl через test proxy не сработал"
     if status == "exit_ip_mismatch":
         return "VLESS отвечает, но exit IP не совпал с выбранной политикой проверки"
     return "телефонная проверка не прошла"
+
+
+def phone_failure_human_hint(status: str) -> str:
+    if status in IP_NOT_SUITABLE_STATUSES:
+        return "IP не подходит: с телефона не открывается TCP/443 к candidate IP, значит этот IP не годится как белый входной IP для этой сети"
+    if status == "vless_failed":
+        return "TCP до candidate IP есть, но VLESS/REALITY/curl через test proxy не сработал"
+    if status == "exit_ip_mismatch":
+        return "VLESS отвечает, но exit IP не совпал с выбранной политикой проверки"
+    return "телефонная проверка не прошла"
+
+
+def phone_failure_title(status: str) -> str:
+    if status in IP_NOT_SUITABLE_STATUSES:
+        return "IP не подходит для этой сети"
+    return "Авто-тестер не подтвердил IP"
+
+
+def phone_failure_detail_label(status: str) -> str:
+    if status in IP_NOT_SUITABLE_STATUSES:
+        return "Диагностика"
+    return "Ошибка"
 
 
 def pause_all_testing():
@@ -1527,7 +2065,7 @@ def reset_vless_test_to_queued(test_id: int) -> dict:
         return {"id": int(test_id), "status": "queued"}
 
 
-def start_manual_retry(test_id: int) -> dict:
+def start_manual_retry(test_id: int, actor: str = "dashboard") -> dict:
     row = get_vless_test_by_id(test_id)
     if not row:
         raise RuntimeError("test not found")
@@ -1536,12 +2074,26 @@ def start_manual_retry(test_id: int) -> dict:
         raise RuntimeError(f"retry is allowed only for failed/review statuses, current status={status}")
 
     if status in PHONE_FAILURE_STATUSES and row.get("server_id") and row.get("vless_key"):
-        return reset_vless_test_to_queued(test_id)
+        result = reset_vless_test_to_queued(test_id)
+        audit_log("retry_existing_server", str(test_id), {"status": status}, actor=actor)
+        return result
 
     if is_provisioning_paused():
         raise RuntimeError("server creation is paused; use /test_start first")
 
     record = GoodIpRecord(ip=row["ip"], region=row["region"], ip_id=row["ip_id"] or "")
+    if not region_can_provision(record.region):
+        error = region_provision_block_reason(record.region)
+        task_id = mark_provision_failed(
+            record,
+            error,
+            server_id=row.get("server_id") or "",
+            vless_key=row.get("vless_key") or "",
+        )
+        result = {"id": int(task_id or test_id), "status": "provision_failed", "error": error}
+        audit_log("retry_blocked_region", str(test_id), result, actor=actor)
+        return result
+
     with vless_queue_lock, get_vless_queue_conn() as conn:
         conn.execute(
             """
@@ -1555,10 +2107,12 @@ def start_manual_retry(test_id: int) -> dict:
 
     thread = threading.Thread(target=run_single_vless_test, args=(record,), kwargs={"force": True}, daemon=True)
     thread.start()
-    return {"id": int(test_id), "status": "provisioning"}
+    result = {"id": int(test_id), "status": "provisioning"}
+    audit_log("retry_provisioning", str(test_id), {"region": record.region}, actor=actor)
+    return result
 
 
-def manually_delete_vless_test(test_id: int) -> dict:
+def manually_delete_vless_test(test_id: int, actor: str = "dashboard") -> dict:
     row = get_vless_test_by_id(test_id)
     if not row:
         raise RuntimeError("test not found")
@@ -1597,7 +2151,115 @@ def manually_delete_vless_test(test_id: int) -> dict:
             (error_text[:1000], now_ts(), int(test_id)),
         )
 
-    return {"id": int(test_id), "status": "manual_banned", "cleanup_errors": cleanup_errors}
+    result = {"id": int(test_id), "status": "manual_banned", "cleanup_errors": cleanup_errors}
+    audit_log("delete_ip", str(test_id), {"ip": record.ip, "region": record.region, "status": status, "cleanup_errors": cleanup_errors}, actor=actor)
+    return result
+
+
+def select_test_ids(statuses: list[str] | None = None, region: str = "", older_than: int | None = None, limit: int = 100) -> list[int]:
+    init_vless_queue()
+    clauses = []
+    params = []
+    if statuses:
+        placeholders = ",".join("?" for _ in statuses)
+        clauses.append(f"status IN ({placeholders})")
+        params.extend(statuses)
+    if region:
+        clauses.append("region = ?")
+        params.append(region)
+    if older_than is not None:
+        clauses.append("COALESCE(tested_at, reserved_at, created_at) < ?")
+        params.append(int(older_than))
+    where = " AND ".join(clauses) if clauses else "1=1"
+    limit = max(1, min(int(limit or 100), 300))
+    with vless_queue_lock, get_vless_queue_conn() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT id
+            FROM vless_tests
+            WHERE {where}
+            ORDER BY COALESCE(tested_at, reserved_at, created_at) ASC
+            LIMIT ?
+            """,
+            [*params, limit],
+        ).fetchall()
+    return [int(row["id"]) for row in rows]
+
+
+def mark_region_tests_provision_failed(region: str, actor: str = "dashboard") -> dict:
+    if region not in DEFAULT_REGIONS and region not in REGIONS:
+        raise RuntimeError(f"unknown region: {region}")
+    error = region_provision_block_reason(region)
+    now = now_ts()
+    with vless_queue_lock, get_vless_queue_conn() as conn:
+        cur = conn.execute(
+            """
+            UPDATE vless_tests
+            SET status = 'provision_failed', attempts = 0, worker = NULL,
+                error = ?, reserved_at = NULL, tested_at = ?
+            WHERE region = ?
+              AND status NOT IN ('approved', 'manual_banned', 'deleted')
+            """,
+            (error, now, region),
+        )
+        changed = int(cur.rowcount or 0)
+    result = {"region": region, "changed": changed, "status": "provision_failed"}
+    audit_log("bulk_mark_region_provision_failed", region, result, actor=actor)
+    return result
+
+
+def bulk_dashboard_action(payload: dict, actor: str = "dashboard") -> dict:
+    action = (payload.get("action") or "").strip().lower()
+    limit = max(1, min(int(payload.get("limit") or 100), 300))
+    results = []
+    errors = []
+
+    if action == "delete_ip_not_suitable":
+        ids = select_test_ids(statuses=sorted(IP_NOT_SUITABLE_STATUSES), limit=limit)
+        for test_id in ids:
+            try:
+                results.append(manually_delete_vless_test(test_id, actor=actor))
+            except Exception as e:
+                errors.append({"id": test_id, "error": str(e)})
+        audit_log("bulk_delete_ip_not_suitable", "", {"count": len(results), "errors": errors}, actor=actor)
+        return {"ok": True, "action": action, "count": len(results), "results": results, "errors": errors}
+
+    if action == "retry_vless_failed":
+        ids = select_test_ids(statuses=["vless_failed"], limit=limit)
+        for test_id in ids:
+            try:
+                results.append(start_manual_retry(test_id, actor=actor))
+            except Exception as e:
+                errors.append({"id": test_id, "error": str(e)})
+        audit_log("bulk_retry_vless_failed", "", {"count": len(results), "errors": errors}, actor=actor)
+        return {"ok": True, "action": action, "count": len(results), "results": results, "errors": errors}
+
+    if action == "mark_region_provision_failed":
+        region = (payload.get("region") or "").strip()
+        if not region:
+            raise RuntimeError("region is required")
+        result = mark_region_tests_provision_failed(region, actor=actor)
+        return {"ok": True, "action": action, **result}
+
+    if action == "delete_old_provision_failed":
+        days = max(1, min(int(payload.get("days") or 7), 365))
+        older_than = now_ts() - days * 86400
+        ids = select_test_ids(statuses=["provision_failed"], older_than=older_than, limit=limit)
+        for test_id in ids:
+            try:
+                results.append(manually_delete_vless_test(test_id, actor=actor))
+            except Exception as e:
+                errors.append({"id": test_id, "error": str(e)})
+        audit_log("bulk_delete_old_provision_failed", "", {"days": days, "count": len(results), "errors": errors}, actor=actor)
+        return {"ok": True, "action": action, "days": days, "count": len(results), "results": results, "errors": errors}
+
+    if action == "reconcile_dry_run":
+        return {"ok": True, "action": action, "result": reconcile_resources(cleanup=False, actor=actor)}
+
+    if action == "cleanup_stale_temp_servers":
+        return {"ok": True, "action": action, "result": reconcile_resources(cleanup=True, actor=actor, limit=limit)}
+
+    raise RuntimeError("unknown bulk action")
 
 
 def get_vless_queue_stats() -> dict:
@@ -1607,8 +2269,9 @@ def get_vless_queue_stats() -> dict:
             "SELECT status, COUNT(*) AS cnt FROM vless_tests GROUP BY status"
         ).fetchall()
         stats = {row["status"]: int(row["cnt"]) for row in rows}
-    for status in ["queued", "testing", "provisioning", "approved", "phone_tcp_unreachable", "vless_failed", "exit_ip_mismatch", "phone_failed", "provision_failed", "manual_banned", "rejected", "error"]:
+    for status in ["queued", "testing", "provisioning", "approved", "ip_not_suitable", "phone_tcp_unreachable", "vless_failed", "exit_ip_mismatch", "phone_failed", "provision_failed", "manual_banned", "rejected", "error"]:
         stats.setdefault(status, 0)
+    stats["ip_not_suitable_total"] = stats.get("ip_not_suitable", 0) + stats.get("phone_tcp_unreachable", 0)
     return stats
 
 
@@ -1618,11 +2281,170 @@ def format_vless_queue_stats() -> str:
         f"queued={stats.get('queued', 0)}, "
         f"testing={stats.get('testing', 0)}, "
         f"approved={stats.get('approved', 0)}, "
-        f"tcp_unreachable={stats.get('phone_tcp_unreachable', 0)}, "
+        f"ip_not_suitable={stats.get('ip_not_suitable_total', 0)}, "
         f"vless_failed={stats.get('vless_failed', 0)}, "
         f"exit_mismatch={stats.get('exit_ip_mismatch', 0)}, "
         f"provision_failed={stats.get('provision_failed', 0)}"
     )
+
+
+def load_approved_region_counts() -> dict[str, int]:
+    counts: dict[str, int] = {}
+    if not APPROVED_KEYS_FILE.exists():
+        return counts
+    with open(APPROVED_KEYS_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) >= 2:
+                counts[parts[1]] = counts.get(parts[1], 0) + 1
+    return counts
+
+
+def region_diagnostics() -> list[dict]:
+    good_counts: dict[str, int] = {}
+    for record in load_good_ips():
+        good_counts[record.region] = good_counts.get(record.region, 0) + 1
+    approved_region_counts = load_approved_region_counts()
+
+    by_region: dict[str, dict] = {}
+    init_vless_queue()
+    with vless_queue_lock, get_vless_queue_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT region, status, COUNT(*) AS cnt
+            FROM vless_tests
+            GROUP BY region, status
+            """
+        ).fetchall()
+        last_rows = conn.execute(
+            """
+            SELECT region, status, error, COALESCE(tested_at, reserved_at, created_at) AS ts
+            FROM vless_tests
+            WHERE error IS NOT NULL AND error != ''
+            ORDER BY COALESCE(tested_at, reserved_at, created_at) DESC
+            """
+        ).fetchall()
+
+    regions = set(DEFAULT_REGIONS) | set(REGIONS) | set(good_counts) | set(approved_region_counts)
+    for row in rows:
+        regions.add(row["region"])
+
+    for region in sorted(regions):
+        statuses = {status: 0 for status in ["approved", "ip_not_suitable", "phone_tcp_unreachable", "vless_failed", "exit_ip_mismatch", "phone_failed", "provision_failed", "manual_banned", "queued", "testing", "provisioning", "error"]}
+        by_region[region] = {
+            "region": region,
+            "selected": region in get_selected_regions(),
+            "preemptible": region in provision_preemptible_regions(),
+            "can_provision": region_can_provision(region),
+            "good_ips": good_counts.get(region, 0),
+            "approved_keys": approved_region_counts.get(region, 0),
+            "statuses": statuses,
+            "last_error": "",
+            "last_error_at": 0,
+        }
+
+    for row in rows:
+        item = by_region.setdefault(row["region"], {"region": row["region"], "statuses": {}})
+        item.setdefault("statuses", {})[row["status"]] = int(row["cnt"])
+
+    for item in by_region.values():
+        statuses = item["statuses"]
+        statuses["ip_not_suitable_total"] = statuses.get("ip_not_suitable", 0) + statuses.get("phone_tcp_unreachable", 0)
+        total_finished = sum(
+            statuses.get(status, 0)
+            for status in ["approved", "ip_not_suitable", "phone_tcp_unreachable", "vless_failed", "exit_ip_mismatch", "phone_failed", "provision_failed", "error"]
+        )
+        item["success_rate"] = round((statuses.get("approved", 0) / total_finished) * 100, 1) if total_finished else None
+
+    seen_last_error = set()
+    for row in last_rows:
+        region = row["region"]
+        if region in seen_last_error or region not in by_region:
+            continue
+        by_region[region]["last_error"] = redact_text(row["error"] or "")
+        by_region[region]["last_error_at"] = int(row["ts"] or 0)
+        seen_last_error.add(region)
+
+    return list(by_region.values())
+
+
+def dashboard_metrics() -> dict:
+    day_ago = now_ts() - 86400
+    init_vless_queue()
+    with vless_queue_lock, get_vless_queue_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT status, COUNT(*) AS cnt
+            FROM vless_tests
+            WHERE COALESCE(tested_at, reserved_at, created_at) >= ?
+            GROUP BY status
+            """,
+            (day_ago,),
+        ).fetchall()
+        latency = conn.execute(
+            """
+            SELECT AVG(latency_ms) AS avg_latency
+            FROM vless_tests
+            WHERE status = 'approved' AND latency_ms IS NOT NULL
+            """
+        ).fetchone()
+    last24 = {row["status"]: int(row["cnt"]) for row in rows}
+    last24["ip_not_suitable_total"] = last24.get("ip_not_suitable", 0) + last24.get("phone_tcp_unreachable", 0)
+    return {
+        "last24": last24,
+        "avg_approved_latency_ms": int(latency["avg_latency"]) if latency and latency["avg_latency"] is not None else None,
+    }
+
+
+def active_server_ids() -> set[str]:
+    init_vless_queue()
+    with vless_queue_lock, get_vless_queue_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT server_id
+            FROM vless_tests
+            WHERE server_id IS NOT NULL AND server_id != ''
+              AND status IN ('queued', 'testing', 'provisioning')
+            """
+        ).fetchall()
+    return {str(row["server_id"]) for row in rows if row["server_id"]}
+
+
+def reconcile_resources(cleanup: bool = False, actor: str = "dashboard", limit: int = 100) -> dict:
+    active_ids = active_server_ids()
+    regions = sorted(set(get_selected_regions()) | {record.region for record in load_good_ips()})
+    result = {"cleanup": cleanup, "regions": [], "stale_servers": [], "deleted_servers": [], "errors": []}
+    deleted = 0
+
+    for region in regions:
+        conn = None
+        region_item = {"region": region, "temp_servers": 0, "stale_servers": 0}
+        try:
+            conn = get_connection(region)
+            for server in conn.compute.servers():
+                server_id = getattr(server, "id", "")
+                name = getattr(server, "name", "") or ""
+                if not name.startswith(PROVISION_SERVER_NAME_PREFIX):
+                    continue
+                region_item["temp_servers"] += 1
+                stale = bool(server_id and server_id not in active_ids)
+                if not stale:
+                    continue
+                region_item["stale_servers"] += 1
+                server_info = {"region": region, "id": server_id, "name": name}
+                result["stale_servers"].append(server_info)
+                if cleanup and deleted < limit:
+                    cleanup_test_server(conn, server_id, "")
+                    result["deleted_servers"].append(server_info)
+                    deleted += 1
+        except Exception as e:
+            result["errors"].append({"region": region, "error": str(e)})
+        finally:
+            close_connection(conn)
+        result["regions"].append(region_item)
+
+    audit_log("reconcile_cleanup" if cleanup else "reconcile_dry_run", "", result, actor=actor)
+    return result
 
 
 def get_recent_vless_results(limit: int = 10) -> list[dict]:
@@ -1638,15 +2460,23 @@ def get_recent_vless_results(limit: int = 10) -> list[dict]:
             """,
             (limit,),
         ).fetchall()
-        return [dict(row) for row in rows]
+    results = []
+    for row in rows:
+        item = dict(row)
+        item["error"] = redact_text(item.get("error") or "")
+        item["display_status"] = "ip_not_suitable" if item.get("status") in IP_NOT_SUITABLE_STATUSES else item.get("status")
+        results.append(item)
+    return results
 
 
 def reserve_vless_tests(worker: str, limit: int) -> list[dict]:
     init_vless_queue()
     worker = (worker or "unknown-worker")[:80]
-    limit = max(1, min(int(limit or TESTER_BATCH_SIZE), TESTER_BATCH_SIZE))
+    batch_size = tester_batch_size()
+    limit = max(1, min(int(limit or batch_size), batch_size))
+    max_attempts = tester_max_attempts()
     now = now_ts()
-    stale_before = now - TESTER_LEASE_SECONDS
+    stale_before = now - tester_lease_seconds()
 
     with vless_queue_lock, get_vless_queue_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -1662,7 +2492,7 @@ def reserve_vless_tests(worker: str, limit: int) -> list[dict]:
             ORDER BY created_at ASC
             LIMIT ?
             """,
-            (TESTER_MAX_ATTEMPTS, stale_before, limit),
+            (max_attempts, stale_before, limit),
         ).fetchall()
         ids = [int(row["id"]) for row in rows]
         if not ids:
@@ -1763,7 +2593,7 @@ def complete_vless_test_result(result: dict, worker: str = "") -> dict:
             save_approved_key(record, vless_key)
             send(TELEGRAM_ALLOWED_CHAT_ID, f"✅ Авто-тестер принял IP: {record.ip} ({record.region}), {latency_ms or '-'} ms")
             conn = get_connection(record.region)
-            if server_id and PROVISION_DELETE_SERVER_AFTER_RESULT:
+            if server_id and provision_delete_server_after_result():
                 cleanup_test_server(conn, server_id, record.ip)
         except Exception as e:
             print(f"⚠️ Post-approve cleanup failed for {record.ip}: {e}", flush=True)
@@ -1771,6 +2601,20 @@ def complete_vless_test_result(result: dict, worker: str = "") -> dict:
         finally:
             close_connection(conn)
     else:
+        if final_status in IP_NOT_SUITABLE_STATUSES:
+            send(
+                TELEGRAM_ALLOWED_CHAT_ID,
+                "⚠️ IP не подходит для этой сети, автобана нет\n"
+                f"ID: {test_id}\n"
+                f"IP: {record.ip} ({record.region})\n"
+                f"Статус: {final_status}\n"
+                f"Диагностика: {error or 'TCP/443 unavailable from phone'}\n"
+                f"Что значит: {phone_failure_human_hint(final_status)}\n\n"
+                "Решение: dashboard → Удалить IP, если это обычный найденный кандидат; "
+                "или Повторить, если есть подозрение на временный сбой.",
+            )
+            return {"id": test_id, "saved": True, "status": final_status}
+
         send(
             TELEGRAM_ALLOWED_CHAT_ID,
             "⚠️ Авто-тестер НЕ подтвердил IP, но IP не забанен автоматически\n"
@@ -1791,7 +2635,7 @@ def save_worker_heartbeat(payload: dict, worker: str = "") -> dict:
     now = now_ts()
 
     def cut(name: str, limit: int = 1000) -> str:
-        return str(payload.get(name) or "")[:limit]
+        return redact_text(payload.get(name) or "")[:limit]
 
     control_ok = 1 if payload.get("control_ok") else 0
     api_ok = 1 if payload.get("api_ok", True) else 0
@@ -1839,6 +2683,9 @@ def get_worker_statuses() -> list[dict]:
         item = dict(row)
         item["control_ok"] = bool(item.get("control_ok"))
         item["api_ok"] = bool(item.get("api_ok"))
+        item["last_error"] = redact_text(item.get("last_error") or "")
+        item["current_task"] = redact_text(item.get("current_task") or "")
+        item["log_tail"] = redact_text(item.get("log_tail") or "")
         item["age_seconds"] = max(0, now - int(item.get("updated_at") or 0))
         item["online"] = item["age_seconds"] <= 90
         workers.append(item)
@@ -1858,7 +2705,13 @@ def get_recent_vless_tests(limit: int = 50) -> list[dict]:
             """,
             (limit,),
         ).fetchall()
-        return [dict(row) for row in rows]
+        tests = []
+        for row in rows:
+            item = dict(row)
+            item["error"] = redact_text(item.get("error") or "")
+            item["display_status"] = "ip_not_suitable" if item.get("status") in IP_NOT_SUITABLE_STATUSES else item.get("status")
+            tests.append(item)
+        return tests
 
 
 def tail_file_text(path: Path, lines: int = 200, max_bytes: int = 200_000) -> str:
@@ -1867,7 +2720,7 @@ def tail_file_text(path: Path, lines: int = 200, max_bytes: int = 200_000) -> st
             return ""
         data = path.read_bytes()[-max_bytes:]
         text = data.decode("utf-8", errors="replace")
-        return "\n".join(text.splitlines()[-lines:])
+        return redact_text("\n".join(text.splitlines()[-lines:]))
     except Exception as e:
         return f"Не удалось прочитать {path}: {e}"
 
@@ -1903,22 +2756,25 @@ def dashboard_snapshot() -> dict:
             "current_attempt": fs.get("current_attempt") or 0,
             "current_region": fs.get("current_region") or "",
             "last_ip": fs.get("last_ip") or "",
-            "last_error": fs.get("last_error") or "",
+            "last_error": redact_text(fs.get("last_error") or ""),
             "started_at": fs.get("started_at") or "",
             "selected_regions": get_selected_regions(),
         },
         "control": get_tester_control_state(),
         "provisioning": {"state": provision_state},
         "counts": {
-            "target": TARGET_COUNT,
+            "target": target_count(),
             "approved": approved_count(),
             "candidates": count_good_ips(),
             "banned": len(load_banned_ips()),
             "whitelist": whitelist_count,
         },
         "queue": get_vless_queue_stats(),
+        "metrics": dashboard_metrics(),
+        "regions": region_diagnostics(),
         "workers": get_worker_statuses(),
         "tests": get_recent_vless_tests(limit=50),
+        "audit": get_audit_events(limit=20),
         "logs": {
             "finder": tail_file_text(LOG_FILE, DASHBOARD_LOG_LINES),
         },
@@ -1954,23 +2810,38 @@ def dashboard_html() -> str:
     .span2 { grid-column: span 2; }
     .badge { display:inline-block; border-radius:999px; padding:2px 8px; background:#1e2a46; border:1px solid var(--line); font-size:12px; }
     .row { display:flex; align-items:center; justify-content:space-between; gap:12px; }
-    button { background:#2563eb; color:white; border:0; border-radius:10px; padding:8px 10px; font-weight:700; cursor:pointer; margin:2px; }
-    button:hover { background:#1d4ed8; }
+    .toolbar { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+    input, select { background:#080d19; border:1px solid var(--line); color:var(--text); border-radius:10px; padding:8px 10px; }
+    .scroll { overflow:auto; }
+    button, a.button { background:#2563eb; color:white; border:0; border-radius:10px; padding:8px 10px; font-weight:700; cursor:pointer; margin:2px; text-decoration:none; display:inline-block; }
+    button:hover, a.button:hover { background:#1d4ed8; }
     button.danger { background:#b91c1c; }
     button.danger:hover { background:#991b1b; }
-    button.secondary { background:#475569; }
-    button.secondary:hover { background:#334155; }
+    button.secondary, a.button.secondary { background:#475569; }
+    button.secondary:hover, a.button.secondary:hover { background:#334155; }
     @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } .span4,.span2 { grid-column: span 1; } table { font-size:12px; } }
   </style>
 </head>
 <body>
 <header><div class="row"><h1>🚀 Selectel Finder Dashboard</h1><button onclick="load()">Обновить</button></div><div class="muted" id="updated">загрузка...</div></header>
 <main>
+  <p><a class="button secondary" href="/dashboard/settings">Настройки</a></p>
   <div class="grid">
     <div class="card"><h2>Finder</h2><div class="num" id="finderState">-</div><div class="muted" id="finderMeta"></div></div>
     <div class="card"><h2>Approved</h2><div class="num ok" id="approved">0</div><div class="muted" id="target"></div></div>
     <div class="card"><h2>Queue</h2><div class="num" id="queueTotal">0</div><div class="muted" id="queueMeta"></div></div>
     <div class="card"><h2>Workers</h2><div class="num" id="workersTotal">0</div><div class="muted" id="workersMeta"></div></div>
+    <div class="card span4"><h2>Bulk / обслуживание</h2><div class="toolbar">
+      <button class="danger" onclick="bulkAction('delete_ip_not_suitable')">Удалить все IP не подходят</button>
+      <button class="secondary" onclick="bulkAction('retry_vless_failed')">Retry все vless_failed</button>
+      <select id="bulkRegion"></select><button class="secondary" onclick="bulkAction('mark_region_provision_failed')">Регион в provision_failed</button>
+      <input id="oldDays" type="number" min="1" max="365" value="7" style="width:88px"><button class="danger" onclick="bulkAction('delete_old_provision_failed')">Удалить старые provision_failed</button>
+      <button class="secondary" onclick="bulkAction('reconcile_dry_run')">Reconcile dry-run</button>
+      <button class="danger" onclick="bulkAction('cleanup_stale_temp_servers')">Cleanup stale temp servers</button>
+    </div><div class="muted" id="bulkResult"></div></div>
+    <div class="card span2"><h2>Метрики</h2><div id="metrics"></div></div>
+    <div class="card span2"><h2>Audit</h2><div id="audit"></div></div>
+    <div class="card span4"><h2>Регионы</h2><div class="scroll"><table id="regions"><thead><tr><th>Регион</th><th>Поиск</th><th>Preemptible</th><th>Provision</th><th>Good</th><th>Approved</th><th>IP не подходит</th><th>vless_failed</th><th>provision_failed</th><th>Success</th><th>Последняя ошибка</th></tr></thead><tbody></tbody></table></div></div>
     <div class="card span2"><h2>Телефон / workers</h2><div id="workers"></div></div>
     <div class="card span2"><h2>Состояние</h2><div id="state"></div></div>
     <div class="card span4"><h2>Последние тесты</h2><div style="overflow:auto"><table id="tests"><thead><tr><th>ID</th><th>IP</th><th>Регион</th><th>Статус</th><th>Поп.</th><th>Worker</th><th>Exit IP</th><th>ms</th><th>Ошибка</th><th>Действия</th></tr></thead><tbody></tbody></table></div></div>
@@ -1981,10 +2852,19 @@ def dashboard_html() -> str:
 <script>
 function esc(s){return String(s ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));}
 function age(s){ if(s == null) return '-'; if(s < 60) return s+' сек'; if(s < 3600) return Math.round(s/60)+' мин'; return Math.round(s/3600)+' ч'; }
-function canAct(status){ return ['phone_tcp_unreachable','vless_failed','exit_ip_mismatch','phone_failed','provision_failed','rejected','error'].includes(status); }
+function isIpNotSuitable(status){ return ['ip_not_suitable','phone_tcp_unreachable'].includes(status); }
+function canAct(status){ return ['ip_not_suitable','phone_tcp_unreachable','vless_failed','exit_ip_mismatch','phone_failed','provision_failed','rejected','error'].includes(status); }
 function actionButtons(t){
   if(!canAct(t.status)) return '';
-  return `<button class="secondary" onclick="dashAction('retry', ${t.id})">🔁 Повторить</button><button class="danger" onclick="dashAction('delete', ${t.id})">🗑 Удалить IP</button>`;
+  const deleteLabel = isIpNotSuitable(t.status) ? 'Отклонить IP' : 'Удалить IP';
+  return `<button class="secondary" onclick="dashAction('retry', ${t.id})">Повторить</button><button class="danger" onclick="dashAction('delete', ${t.id})">${deleteLabel}</button>`;
+}
+function diagnosticText(t){
+  const raw = esc(t.error || '');
+  if(isIpNotSuitable(t.status)){
+    return `<b class="warn">IP не подходит</b>${raw ? '<br><span class="muted">'+raw+'</span>' : ''}`;
+  }
+  return raw;
 }
 async function dashAction(action, id){
   const label = action === 'delete' ? 'удалить IP, сервер/floating IP и добавить в бан' : 'повторить проверку';
@@ -1992,6 +2872,18 @@ async function dashAction(action, id){
   const r = await fetch('/dashboard/api/action', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({action, id})});
   const data = await r.json().catch(()=>({ok:false,error:'bad json'}));
   if(!r.ok || !data.ok){ alert('Ошибка: ' + (data.error || r.status)); return; }
+  await load();
+}
+async function bulkAction(action){
+  const payload = {action, limit:100};
+  if(action === 'mark_region_provision_failed') payload.region = document.getElementById('bulkRegion').value;
+  if(action === 'delete_old_provision_failed') payload.days = Number(document.getElementById('oldDays').value || 7);
+  const destructive = ['delete_ip_not_suitable','delete_old_provision_failed','cleanup_stale_temp_servers'].includes(action);
+  if(destructive && !confirm('Запустить bulk action: ' + action + '?')) return;
+  const r = await fetch('/dashboard/api/bulk_action', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+  const data = await r.json().catch(()=>({ok:false,error:'bad json'}));
+  if(!r.ok || !data.ok){ alert('Ошибка: ' + (data.error || r.status)); return; }
+  document.getElementById('bulkResult').textContent = JSON.stringify(data.result || {count:data.count, errors:data.errors || []}).slice(0, 900);
   await load();
 }
 async function load(){
@@ -2005,23 +2897,168 @@ async function load(){
   document.getElementById('target').textContent = 'цель: ' + d.counts.target + ', кандидаты: ' + d.counts.candidates + ', ban: ' + d.counts.banned;
   const q = d.queue || {}; const total = (q.queued||0)+(q.testing||0)+(q.provisioning||0);
   document.getElementById('queueTotal').textContent = total;
-  document.getElementById('queueMeta').textContent = `queued=${q.queued||0}, testing=${q.testing||0}, provisioning=${q.provisioning||0}, approved=${q.approved||0}, tcp_unreachable=${q.phone_tcp_unreachable||0}, vless_failed=${q.vless_failed||0}, exit_mismatch=${q.exit_ip_mismatch||0}, phone_failed=${q.phone_failed||0}, provision_failed=${q.provision_failed||0}, banned=${q.manual_banned||0}`;
+  document.getElementById('queueMeta').textContent = `queued=${q.queued||0}, testing=${q.testing||0}, provisioning=${q.provisioning||0}, approved=${q.approved||0}, ip_not_suitable=${q.ip_not_suitable_total||0}, vless_failed=${q.vless_failed||0}, exit_mismatch=${q.exit_ip_mismatch||0}, phone_failed=${q.phone_failed||0}, provision_failed=${q.provision_failed||0}, banned=${q.manual_banned||0}`;
   document.getElementById('workersTotal').textContent = (d.workers||[]).length;
   document.getElementById('workersMeta').textContent = (d.workers||[]).filter(w=>w.online).length + ' online';
   const c = d.control || {};
   document.getElementById('state').innerHTML = `<p>Testing: <b class="${c.testing_paused?'warn':'ok'}">${c.testing_paused?'paused':'running'}</b></p><p>Provisioning: <b class="${c.provisioning_paused?'warn':'ok'}">${esc(d.provisioning.state)}${c.provisioning_paused?' / paused':''}</b></p><p>Последний IP: <code>${esc(d.finder.last_ip || '-')}</code></p><p>Последняя ошибка: <span class="bad">${esc(d.finder.last_error || '-')}</span></p><p>Регионы: ${esc((d.finder.selected_regions||[]).join(', '))}</p>`;
   const workers = d.workers || [];
+  const regionSelect = document.getElementById('bulkRegion');
+  const currentRegion = regionSelect.value;
+  regionSelect.innerHTML = (d.regions||[]).map(r => `<option value="${esc(r.region)}">${esc(r.region)}</option>`).join('');
+  if(currentRegion) regionSelect.value = currentRegion;
+  const m = d.metrics || {}; const last24 = m.last24 || {};
+  document.getElementById('metrics').innerHTML = `<p>24h approved: <b class="ok">${last24.approved||0}</b></p><p>24h IP не подходит: <b class="warn">${last24.ip_not_suitable_total||0}</b></p><p>24h vless_failed: <b class="bad">${last24.vless_failed||0}</b></p><p>avg approved latency: ${m.avg_approved_latency_ms || '-'} ms</p>`;
+  document.getElementById('audit').innerHTML = (d.audit||[]).slice(0,8).map(a => `<div style="margin-bottom:8px"><span class="badge">${esc(a.action)}</span> <span class="muted">${new Date(a.created_at*1000).toLocaleString()}</span><br>${esc(a.target||'')}<br><span class="muted">${esc(a.details||'')}</span></div>`).join('') || '<span class="muted">пока нет изменений</span>';
+  document.querySelector('#regions tbody').innerHTML = (d.regions||[]).map(r => {
+    const s = r.statuses || {};
+    return `<tr><td><code>${esc(r.region)}</code></td><td>${r.selected?'yes':'-'}</td><td>${r.preemptible?'yes':'-'}</td><td><span class="${r.can_provision?'ok':'bad'}">${r.can_provision?'yes':'no'}</span></td><td>${r.good_ips||0}</td><td>${r.approved_keys||0}</td><td>${s.ip_not_suitable_total||0}</td><td>${s.vless_failed||0}</td><td>${s.provision_failed||0}</td><td>${r.success_rate == null ? '-' : r.success_rate+'%'}</td><td class="bad">${esc(r.last_error||'')}</td></tr>`;
+  }).join('');
   document.getElementById('workers').innerHTML = workers.length ? workers.map(w => `<div style="margin-bottom:10px"><span class="badge ${w.online?'ok':'bad'}">${w.online?'online':'offline'}</span> <b>${esc(w.worker)}</b><br><span class="muted">last seen: ${age(w.age_seconds)}, control=${w.control_ok?'OK':'NO'}, api=${w.api_ok?'OK':'NO'}, task=${esc(w.current_task||'-')}</span><br><span class="bad">${esc(w.last_error||'')}</span></div>`).join('') : '<span class="muted">нет heartbeat от телефона</span>';
   const lastWorker = workers[0];
   document.getElementById('phoneLog').textContent = lastWorker && lastWorker.log_tail ? lastWorker.log_tail : 'Пока нет логов телефона. Обнови termux_vless_tester.py до dashboard-версии.';
   document.getElementById('finderLog').textContent = d.logs.finder || 'лог пуст';
   const tbody = document.querySelector('#tests tbody');
-  tbody.innerHTML = (d.tests||[]).map(t => `<tr><td>${t.id}</td><td><code>${esc(t.ip)}</code></td><td>${esc(t.region)}</td><td><span class="badge">${esc(t.status)}</span></td><td>${t.attempts||0}</td><td>${esc(t.worker||'-')}</td><td>${esc(t.exit_ip||'-')}</td><td>${esc(t.latency_ms||'-')}</td><td class="bad">${esc(t.error||'')}</td><td>${actionButtons(t)}</td></tr>`).join('');
+  tbody.innerHTML = (d.tests||[]).map(t => `<tr><td>${t.id}</td><td><code>${esc(t.ip)}</code></td><td>${esc(t.region)}</td><td><span class="badge">${esc(t.display_status || t.status)}</span></td><td>${t.attempts||0}</td><td>${esc(t.worker||'-')}</td><td>${esc(t.exit_ip||'-')}</td><td>${esc(t.latency_ms||'-')}</td><td class="bad">${diagnosticText(t)}</td><td>${actionButtons(t)}</td></tr>`).join('');
 }
 load(); setInterval(load, 10000);
 </script>
 </body>
 </html>"""
+
+
+def dashboard_settings_html() -> str:
+    return """<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Selectel Finder Settings</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0b1020; --card:#121a2d; --muted:#91a0bd; --line:#26324f; --good:#34d399; --bad:#fb7185; --warn:#fbbf24; --text:#e5edff; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: system-ui, -apple-system, Segoe UI, sans-serif; background:var(--bg); color:var(--text); }
+    header { position:sticky; top:0; z-index:10; background:rgba(11,16,32,.92); border-bottom:1px solid var(--line); padding:14px 18px; backdrop-filter: blur(8px); }
+    h1 { margin:0; font-size:20px; }
+    main { padding:18px; max-width:1100px; margin:0 auto; }
+    .row { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+    .group { margin:0 0 16px; background:var(--card); border:1px solid var(--line); border-radius:16px; padding:14px; }
+    .group h2 { margin:0 0 12px; font-size:16px; color:#c8d6f7; }
+    .setting { display:grid; grid-template-columns: minmax(220px, 1fr) minmax(260px, 1.3fr) auto; gap:12px; align-items:center; padding:10px 0; border-top:1px solid var(--line); }
+    .setting:first-of-type { border-top:0; }
+    .label { font-weight:700; }
+    .key { color:var(--muted); font:12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; margin-top:3px; }
+    .muted { color:var(--muted); font-size:13px; }
+    .badge { display:inline-block; border-radius:999px; padding:2px 8px; background:#1e2a46; border:1px solid var(--line); font-size:12px; }
+    .badge.warn { color:var(--warn); }
+    input[type="number"], input[type="text"] { width:100%; background:#080d19; border:1px solid var(--line); color:var(--text); border-radius:10px; padding:9px 10px; font:14px system-ui; }
+    label.check { display:inline-flex; align-items:center; gap:7px; margin:4px 12px 4px 0; color:#c8d6f7; }
+    input[type="checkbox"] { width:18px; height:18px; accent-color:#2563eb; }
+    button, a.button { background:#2563eb; color:white; border:0; border-radius:10px; padding:8px 10px; font-weight:700; cursor:pointer; margin:2px; text-decoration:none; display:inline-block; }
+    button:hover, a.button:hover { background:#1d4ed8; }
+    button.secondary, a.button.secondary { background:#475569; }
+    button.secondary:hover, a.button.secondary:hover { background:#334155; }
+    button.danger { background:#b91c1c; }
+    button.danger:hover { background:#991b1b; }
+    #status { min-height:20px; }
+    @media (max-width: 820px) { .setting { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+<header>
+  <div class="row">
+    <h1>Настройки Selectel Finder</h1>
+    <div>
+      <a class="button secondary" href="/dashboard">Dashboard</a>
+      <button onclick="saveAll()">Сохранить</button>
+      <button class="secondary" onclick="loadSettings()">Обновить</button>
+    </div>
+  </div>
+  <div class="muted" id="status">загрузка...</div>
+</header>
+<main>
+  <section class="group">
+    <h2>Presets</h2>
+    <button class="secondary" onclick="applyPreset('safe_ru3_ru7')">Безопасный ru-3/ru-7</button>
+    <button class="secondary" onclick="applyPreset('fast_test')">Быстрый тест</button>
+    <button class="secondary" onclick="applyPreset('reliable_provisioning')">Надежный provisioning</button>
+    <button class="secondary" onclick="applyPreset('keep_failed_ip')">Сохранять failed IP</button>
+  </section>
+  <div id="settings"></div>
+</main>
+<script>
+let settings = [];
+function esc(s){return String(s ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));}
+function inputHtml(s){
+  if(s.kind === 'bool'){
+    return `<label class="check"><input type="checkbox" id="s_${s.key}" ${s.value ? 'checked' : ''}> включено</label>`;
+  }
+  if(s.kind === 'regions'){
+    return `<div>${(s.choices||[]).map(region => `<label class="check"><input type="checkbox" data-setting="${s.key}" value="${esc(region)}" ${(s.value||[]).includes(region) ? 'checked' : ''}>${esc(region)}</label>`).join('')}</div>`;
+  }
+  return `<input type="number" id="s_${s.key}" value="${esc(s.value)}" min="${esc(s.min ?? '')}" max="${esc(s.max ?? '')}">`;
+}
+function render(){
+  const groups = {};
+  for(const s of settings){ (groups[s.group] ||= []).push(s); }
+  document.getElementById('settings').innerHTML = Object.entries(groups).map(([group, items]) => `
+    <section class="group">
+      <h2>${esc(group)}</h2>
+      ${items.map(s => `
+        <div class="setting">
+          <div><div class="label">${esc(s.label)}</div><div class="key">${esc(s.key)}</div></div>
+          <div>${inputHtml(s)}<div class="muted">env/default: ${Array.isArray(s.default) ? esc(s.default.join(', ')) : esc(s.default)}</div></div>
+          <div><span class="badge ${s.overridden ? 'warn' : ''}">${s.overridden ? 'runtime' : 'env'}</span><br><button class="secondary" onclick="resetOne('${esc(s.key)}')">Сброс</button></div>
+        </div>
+      `).join('')}
+    </section>
+  `).join('');
+}
+function collectValue(s){
+  if(s.kind === 'bool') return document.getElementById('s_'+s.key).checked;
+  if(s.kind === 'regions') return [...document.querySelectorAll(`[data-setting="${s.key}"]:checked`)].map(item => item.value);
+  return Number(document.getElementById('s_'+s.key).value);
+}
+async function loadSettings(){
+  const r = await fetch('/dashboard/api/settings', {cache:'no-store'});
+  const data = await r.json().catch(()=>({ok:false,error:'bad json'}));
+  if(!r.ok || !data.ok){ document.getElementById('status').textContent = 'ошибка загрузки: ' + (data.error || r.status); return; }
+  settings = data.settings || [];
+  document.getElementById('status').textContent = 'обновлено: ' + new Date((data.generated_at||0)*1000).toLocaleString();
+  render();
+}
+async function saveAll(){
+  const values = {};
+  for(const s of settings){ values[s.key] = collectValue(s); }
+  const r = await fetch('/dashboard/api/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({values})});
+  const data = await r.json().catch(()=>({ok:false,error:'bad json'}));
+  if(!r.ok || !data.ok){ alert('Ошибка: ' + (data.error || r.status)); return; }
+  settings = data.settings || [];
+  document.getElementById('status').textContent = 'сохранено: ' + new Date().toLocaleString();
+  render();
+}
+async function resetOne(key){
+  const r = await fetch('/dashboard/api/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({reset:[key]})});
+  const data = await r.json().catch(()=>({ok:false,error:'bad json'}));
+  if(!r.ok || !data.ok){ alert('Ошибка: ' + (data.error || r.status)); return; }
+  settings = data.settings || [];
+  document.getElementById('status').textContent = 'сброшено: ' + key;
+  render();
+}
+async function applyPreset(preset){
+  if(!confirm('Применить preset: ' + preset + '?')) return;
+  const r = await fetch('/dashboard/api/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({preset})});
+  const data = await r.json().catch(()=>({ok:false,error:'bad json'}));
+  if(!r.ok || !data.ok){ alert('Ошибка: ' + (data.error || r.status)); return; }
+  settings = data.settings || [];
+  document.getElementById('status').textContent = 'preset применен: ' + preset;
+  render();
+}
+loadSettings();
+</script>
+</body>
+</html>"""
+
 
 class TesterAPIHandler(BaseHTTPRequestHandler):
     server_version = "SelectelFinderTester/1.0"
@@ -2101,10 +3138,22 @@ class TesterAPIHandler(BaseHTTPRequestHandler):
             self._send_text(200, dashboard_html(), "text/html; charset=utf-8")
             return
 
+        if parsed.path == "/dashboard/settings":
+            if not self._require_dashboard_auth():
+                return
+            self._send_text(200, dashboard_settings_html(), "text/html; charset=utf-8")
+            return
+
         if parsed.path == "/dashboard/api/status":
             if not self._require_dashboard_auth():
                 return
             self._send_json(200, dashboard_snapshot())
+            return
+
+        if parsed.path == "/dashboard/api/settings":
+            if not self._require_dashboard_auth():
+                return
+            self._send_json(200, dashboard_settings_snapshot())
             return
 
         if parsed.path == "/dashboard/api/logs":
@@ -2120,11 +3169,11 @@ class TesterAPIHandler(BaseHTTPRequestHandler):
         if parsed.path == "/next_tests":
             query = parse_qs(parsed.query)
             worker = (query.get("worker") or ["unknown-worker"])[0]
-            limit_raw = (query.get("limit") or [str(TESTER_BATCH_SIZE)])[0]
+            limit_raw = (query.get("limit") or [str(tester_batch_size())])[0]
             try:
                 limit = int(limit_raw)
             except ValueError:
-                limit = TESTER_BATCH_SIZE
+                limit = tester_batch_size()
             if is_testing_paused():
                 self._send_json(200, {"ok": True, "paused": True, "tasks": []})
                 return
@@ -2137,6 +3186,34 @@ class TesterAPIHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urlparse(self.path)
 
+        if parsed.path == "/dashboard/api/settings":
+            if not self._require_dashboard_auth():
+                return
+            try:
+                payload = self._read_json()
+                preset = (payload.get("preset") or "").strip()
+                if preset:
+                    self._send_json(200, apply_runtime_preset(preset, actor=DASHBOARD_USERNAME))
+                else:
+                    self._send_json(200, update_runtime_settings(payload, actor=DASHBOARD_USERNAME))
+            except Exception as e:
+                print(f"[dashboard] settings error: {e}", flush=True)
+                self._send_json(400, {"ok": False, "error": str(e)})
+            return
+
+        if parsed.path == "/dashboard/api/bulk_action":
+            if not self._require_dashboard_auth():
+                return
+            try:
+                payload = self._read_json()
+                result = bulk_dashboard_action(payload, actor=DASHBOARD_USERNAME)
+                result["stats"] = get_vless_queue_stats()
+                self._send_json(200, result)
+            except Exception as e:
+                print(f"[dashboard] bulk action error: {e}", flush=True)
+                self._send_json(400, {"ok": False, "error": str(e)})
+            return
+
         if parsed.path == "/dashboard/api/action":
             if not self._require_dashboard_auth():
                 return
@@ -2145,9 +3222,9 @@ class TesterAPIHandler(BaseHTTPRequestHandler):
                 action = (payload.get("action") or "").strip().lower()
                 test_id = int(payload.get("id") or 0)
                 if action == "retry":
-                    result = start_manual_retry(test_id)
+                    result = start_manual_retry(test_id, actor=DASHBOARD_USERNAME)
                 elif action == "delete":
-                    result = manually_delete_vless_test(test_id)
+                    result = manually_delete_vless_test(test_id, actor=DASHBOARD_USERNAME)
                 else:
                     raise RuntimeError("unknown action")
                 self._send_json(200, {"ok": True, "result": result, "stats": get_vless_queue_stats()})
@@ -2234,6 +3311,17 @@ def delete_floating_ip_address(conn, address: str, ip_id: str = ""):
 
     if target:
         delete_floating_ip(conn, target)
+
+
+def cleanup_failed_floating_ip_if_enabled(conn, record: GoodIpRecord):
+    if not provision_delete_failed_floating_ip():
+        return
+    try:
+        delete_floating_ip_address(conn, record.ip, record.ip_id)
+        remove_good_ip(record.ip)
+        print(f"Deleted failed floating IP after provisioning failure: {record.ip}", flush=True)
+    except Exception as e:
+        print(f"Failed to delete floating IP after provisioning failure for {record.ip}: {e}", flush=True)
 
 
 def get_server_ports(conn, server_id: str):
@@ -2363,7 +3451,7 @@ def get_candidate_flavors(conn, region):
     if not flavors:
         raise RuntimeError(f"No suitable flavors found in {region}")
 
-    return flavors[:PROVISION_MAX_FLAVOR_ATTEMPTS]
+    return flavors[:provision_max_flavor_attempts()]
 
 
 def get_provision_flavor(conn, region):
@@ -2488,10 +3576,10 @@ def tcp_connect_ok(host: str, port: int = 443, timeout: int = 5) -> bool:
 
 
 def wait_for_tcp_port(host: str, port: int = 443) -> bool:
-    if not PROVISION_TCP_CHECK_ENABLED:
+    if not provision_tcp_check_enabled():
         return True
-    retries = max(1, PROVISION_TCP_CHECK_RETRIES)
-    timeout = max(1, PROVISION_TCP_CHECK_TIMEOUT)
+    retries = max(1, provision_tcp_check_retries())
+    timeout = max(1, provision_tcp_check_timeout())
     for attempt in range(1, retries + 1):
         if tcp_connect_ok(host, port=port, timeout=timeout):
             print(f"✅ TCP/{port} открыт на {host}", flush=True)
@@ -2504,12 +3592,9 @@ def wait_for_tcp_port(host: str, port: int = 443) -> bool:
 
 def create_test_server(conn, record: GoodIpRecord):
     region = record.region
-    preemptible = region in PROVISION_PREEMPTIBLE_REGIONS
-    if not preemptible and not PROVISION_ALLOW_NON_PREEMPTIBLE:
-        raise RuntimeError(
-            f"Preemptible servers are not available in {region}; "
-            "set PROVISION_ALLOW_NON_PREEMPTIBLE=true to use regular servers there"
-        )
+    preemptible = region in provision_preemptible_regions()
+    if not region_can_provision(region):
+        raise RuntimeError(region_provision_block_reason(region))
 
     image = get_provision_image(conn, region)
     flavors = get_candidate_flavors(conn, region)
@@ -2558,7 +3643,7 @@ def create_test_server(conn, record: GoodIpRecord):
 
         try:
             server = conn.compute.create_server(**attrs)
-            server = conn.compute.wait_for_server(server, wait=PROVISION_SERVER_WAIT_SECONDS)
+            server = conn.compute.wait_for_server(server, wait=provision_server_wait_seconds())
             attach_floating_ip_to_server(conn, server, record.ip)
 
             print(
@@ -2567,8 +3652,9 @@ def create_test_server(conn, record: GoodIpRecord):
                 flush=True,
             )
 
-            if PROVISION_SETUP_WAIT_SECONDS:
-                time.sleep(PROVISION_SETUP_WAIT_SECONDS)
+            setup_wait = provision_setup_wait_seconds()
+            if setup_wait:
+                time.sleep(setup_wait)
 
             return server
 
@@ -2640,7 +3726,7 @@ def run_single_vless_test(record: GoodIpRecord, force: bool = False):
         server_id = getattr(server, "id", "")
 
         if not wait_for_tcp_port(record.ip, 443):
-            error = f"tcp_443_not_open after {PROVISION_TCP_CHECK_RETRIES} attempts"
+            error = f"tcp_443_not_open after {provision_tcp_check_retries()} attempts"
             task_id = mark_provision_failed(record, error, server_id=server_id, vless_key=vless_key)
             send(
                 TELEGRAM_ALLOWED_CHAT_ID,
@@ -2650,11 +3736,12 @@ def run_single_vless_test(record: GoodIpRecord, force: bool = False):
                 f"Регион: {record.region}\n"
                 "Решение: dashboard → Повторить проверку или Удалить IP.",
             )
-            if server_id and PROVISION_DELETE_SERVER_AFTER_RESULT:
+            if server_id and provision_delete_server_after_result():
                 try:
                     cleanup_test_server(conn, server_id, record.ip)
                 except Exception as cleanup_error:
                     print(f"⚠️ Cleanup after TCP check failed for {record.ip}: {cleanup_error}", flush=True)
+            cleanup_failed_floating_ip_if_enabled(conn, record)
             return
 
         task_id = enqueue_vless_test(record, server_id, vless_key, reset_attempts=force)
@@ -2680,11 +3767,12 @@ def run_single_vless_test(record: GoodIpRecord, force: bool = False):
             "Решение: dashboard → Повторить проверку или Удалить IP.",
         )
         print(f"⚠️ Provisioning/enqueue error for {record.ip}: {e}", flush=True)
-        if server_id and PROVISION_DELETE_SERVER_AFTER_RESULT:
+        if server_id and provision_delete_server_after_result():
             try:
                 cleanup_test_server(conn, server_id, record.ip)
             except Exception as cleanup_error:
                 print(f"⚠️ Cleanup after enqueue error failed for {record.ip}: {cleanup_error}", flush=True)
+        cleanup_failed_floating_ip_if_enabled(conn, record)
     finally:
         close_connection(conn)
 
@@ -2740,14 +3828,29 @@ def start_provisioning_if_needed(networks=None):
 
     slots_left = remaining_slots()
     if slots_left <= 0:
-        send(TELEGRAM_ALLOWED_CHAT_ID, f"✅ Уже есть {approved_count()}/{TARGET_COUNT} рабочих ключей")
+        send(TELEGRAM_ALLOWED_CHAT_ID, f"✅ Уже есть {approved_count()}/{target_count()} рабочих ключей")
         return
 
-    records = [
-        record
-        for record in matching_good_ip_records(networks, exclude_approved=True)
-        if not has_blocking_vless_test_ip(record.ip)
-    ][:slots_left]
+    records = []
+    skipped_regions = 0
+    for record in matching_good_ip_records(networks, exclude_approved=True):
+        if has_blocking_vless_test_ip(record.ip):
+            continue
+        if not region_can_provision(record.region):
+            mark_provision_failed(record, region_provision_block_reason(record.region))
+            skipped_regions += 1
+            continue
+        records.append(record)
+        if len(records) >= slots_left:
+            break
+
+    if skipped_regions:
+        send(
+            TELEGRAM_ALLOWED_CHAT_ID,
+            f"ℹ️ Пропущено IP из регионов без разрешенного provisioning: {skipped_regions}. "
+            "Они помечены как provision_failed без автобана.",
+        )
+
     if not records:
         send(TELEGRAM_ALLOWED_CHAT_ID, "⚠️ Нет подходящих IP для VLESS-проверки или все уже в очереди авто-тестера")
         return
@@ -2803,13 +3906,13 @@ def finder_loop():
             now = time.monotonic()
             slots_left = remaining_slots()
             if slots_left <= 0:
-                print(f"🎯 Все слоты заполнены: {approved_count()}/{TARGET_COUNT}", flush=True)
+                print(f"🎯 Все слоты заполнены: {approved_count()}/{target_count()}", flush=True)
                 running = False
-                send(TELEGRAM_ALLOWED_CHAT_ID, f"🎯 Все слоты заполнены: {approved_count()}/{TARGET_COUNT}")
+                send(TELEGRAM_ALLOWED_CHAT_ID, f"🎯 Все слоты заполнены: {approved_count()}/{target_count()}")
                 time.sleep(5)
                 continue
 
-            if now - last_good_ip_sync >= GOOD_IP_SYNC_INTERVAL:
+            if now - last_good_ip_sync >= good_ip_sync_interval():
                 current_count = sync_good_ips(whitelist, exclude_approved=True)
                 last_good_ip_sync = now
             else:
@@ -2818,14 +3921,14 @@ def finder_loop():
             if current_count >= slots_left:
                 print(
                     f"🎯 Кандидаты для свободных слотов найдены: {current_count}/{slots_left}; "
-                    f"принято {approved_count()}/{TARGET_COUNT}",
+                    f"принято {approved_count()}/{target_count()}",
                     flush=True,
                 )
                 running = False
                 send(
                     TELEGRAM_ALLOWED_CHAT_ID,
                     "🎯 Кандидаты для свободных слотов найдены\n"
-                    f"✅ Принято ключей: {approved_count()}/{TARGET_COUNT}\n"
+                    f"✅ Принято ключей: {approved_count()}/{target_count()}\n"
                     f"📦 Новых кандидатов: {current_count}/{slots_left}\n\n"
                     "Finder остановлен. Серверы еще НЕ созданы.",
                     reply_markup=create_servers_keyboard(),
@@ -2840,7 +3943,7 @@ def finder_loop():
             print("=" * 70, flush=True)
             print(f"Попытка {attempt}", flush=True)
             print(f"🌍 Регион: {region}", flush=True)
-            print(f"✅ Принято: {approved_count()}/{TARGET_COUNT}", flush=True)
+            print(f"✅ Принято: {approved_count()}/{target_count()}", flush=True)
             print(f"📦 Новых кандидатов: {current_count}/{slots_left}", flush=True)
             print("=" * 70, flush=True)
 
@@ -2866,7 +3969,7 @@ def finder_loop():
                     send(
                         TELEGRAM_ALLOWED_CHAT_ID,
                         f"✅ Подходит: {address} ({region})\n"
-                        f"✅ Принято ключей: {approved_count()}/{TARGET_COUNT}\n"
+                        f"✅ Принято ключей: {approved_count()}/{target_count()}\n"
                         f"📦 Новых кандидатов: {new_count}/{slots_left}",
                     )
 
