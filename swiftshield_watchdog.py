@@ -60,8 +60,9 @@ def openstack_no_proxy_value() -> str:
 
 
 def configure_openstack_proxy() -> None:
-    proxy = optional_env("OPENSTACK_PROXY")
-    if not proxy and bool_env("OPENSTACK_PROXY_FALLBACK_TO_SOCKS5_PROXY", True):
+    proxy = optional_env("SWIFTSHIELD_OPENSTACK_PROXY") or optional_env("OPENSTACK_PROXY")
+    fallback = bool_env("SWIFTSHIELD_OPENSTACK_PROXY_FALLBACK_TO_SOCKS5_PROXY", False)
+    if not proxy and fallback:
         proxy = optional_env("SOCKS5_PROXY")
 
     if not proxy:
@@ -161,16 +162,24 @@ def watchdog_config(dry_run_override: bool = False) -> WatchdogConfig:
 
 
 def find_target_server(conn, config: WatchdogConfig):
+    errors = []
+
     if config.server_id:
         try:
             return conn.compute.get_server(config.server_id)
         except Exception as exc:
-            raise RuntimeError(f"Server id not found: {config.server_id}") from exc
+            errors.append(f"id={config.server_id}: {type(exc).__name__}: {exc}")
 
-    server = conn.compute.find_server(config.server_name, ignore_missing=True)
-    if not server:
-        raise RuntimeError(f"Server not found by name: {config.server_name}")
-    return server
+    if config.server_name:
+        try:
+            server = conn.compute.find_server(config.server_name, ignore_missing=True)
+            if server:
+                return server
+            errors.append(f"name={config.server_name}: not found")
+        except Exception as exc:
+            errors.append(f"name={config.server_name}: {type(exc).__name__}: {exc}")
+
+    raise RuntimeError(f"Server lookup failed in {config.region}: {'; '.join(errors)}")
 
 
 def server_status(server) -> str:

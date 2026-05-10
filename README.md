@@ -372,6 +372,8 @@ SWIFTSHIELD_AVAILABILITY_ZONE=
 SWIFTSHIELD_SERVER_ID=223a6632-2fba-456b-b8c7-24b3786c320a
 SWIFTSHIELD_SERVER_NAME=SwiftShield1
 SWIFTSHIELD_NOTIFY_TELEGRAM=true
+SWIFTSHIELD_OPENSTACK_PROXY=
+SWIFTSHIELD_OPENSTACK_PROXY_FALLBACK_TO_SOCKS5_PROXY=false
 ```
 
 Run a dry check:
@@ -399,6 +401,9 @@ The watchdog actions are intentionally narrow:
 
 The dashboard overview reads `SWIFTSHIELD_STATE_FILE` and shows the latest
 server status, last watchdog check, and last successful `start`/`unshelve` time.
+By default, the watchdog does not reuse `SOCKS5_PROXY` for OpenStack API calls,
+because a recovery check should not depend on a proxy that may live on
+`SwiftShield1`.
 
 ## Безопасность
 
