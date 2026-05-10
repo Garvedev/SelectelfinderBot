@@ -86,6 +86,19 @@ function age(seconds) {
   return `${Math.round(seconds / 3600)} ч`;
 }
 
+function timeText(timestamp) {
+  return timestamp ? new Date(timestamp * 1000).toLocaleString() : "-";
+}
+
+function swiftShieldClass(item = {}) {
+  const status = String(item.status || "").toUpperCase();
+  if (!item.enabled) return "warn";
+  if (status === "ACTIVE") return "ok";
+  if (["SHUTOFF", "SHELVED", "SHELVED_OFFLOADED"].includes(status)) return "warn";
+  if (item.ok === false || status === "ERROR") return "bad";
+  return status ? "warn" : "bad";
+}
+
 function setAlert(message = "") {
   const alert = $("#alert");
   alert.textContent = message;
@@ -137,6 +150,7 @@ function renderSnapshot(data) {
   const workers = data.workers || [];
   const metrics = data.metrics || {};
   const last24 = metrics.last24 || {};
+  const swiftshield = data.swiftshield || {};
   const active = activeCount(queue);
   const online = workers.filter((worker) => worker.online).length;
 
@@ -152,6 +166,8 @@ function renderSnapshot(data) {
   $("#statQueueMeta").textContent = `подтверждено ${queue.approved || 0}, ошибка создания ${queue.provision_failed || 0}`;
   $("#statPhones").textContent = workers.length;
   $("#statPhonesMeta").textContent = `${online} на связи`;
+  $("#statSwiftShield").innerHTML = `<span class="${swiftShieldClass(swiftshield)}">${esc(swiftshield.status || (swiftshield.enabled ? "unknown" : "off"))}</span>`;
+  $("#statSwiftShieldMeta").textContent = `запуск: ${timeText(swiftshield.last_launch_at)}`;
 
   $("#finderStartBtn").disabled = Boolean(finder.running || control.full_auto_mode);
   $("#finderStopBtn").disabled = Boolean(!finder.running && !control.full_auto_mode);
@@ -166,6 +182,9 @@ function renderSnapshot(data) {
     ["Последний IP", `<code>${esc(finder.last_ip || "-")}</code>`],
     ["Регионы", esc((finder.selected_regions || []).join(", ") || "-")],
     ["Последняя ошибка", `<span class="bad">${esc(finder.last_error || "-")}</span>`],
+    ["SwiftShield статус", `<span class="${swiftShieldClass(swiftshield)}">${esc(swiftshield.status || (swiftshield.enabled ? "unknown" : "off"))}</span>`],
+    ["SwiftShield последний запуск", esc(timeText(swiftshield.last_launch_at))],
+    ["SwiftShield последняя проверка", esc(timeText(swiftshield.last_check_at))],
   ]);
 
   renderInfoRows($("#metricsPanel"), [

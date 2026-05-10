@@ -6,6 +6,8 @@ good_ips.tmp
 banned_ips.txt
 approved_vless_keys.txt
 finder.log
+swiftshield_watchdog_state.json
+swiftshield_watchdog_state.json.tmp
 vless_tests.sqlite3
 vless_tests.sqlite3-*
 ipwhitelist_safe_cidr.tmp

@@ -357,6 +357,49 @@ sudo systemctl stop finder
 sudo journalctl -u finder -f
 ```
 
+## SwiftShield watchdog
+
+`swiftshield_watchdog.py` is a separate one-shot watchdog for the preemptible
+server `SwiftShield1`. It should run from another server, for example from the
+same host where this SelectelFinder project is deployed.
+
+Add these values to `.env`:
+
+```env
+SWIFTSHIELD_ENABLED=true
+SWIFTSHIELD_REGION=ru-3
+SWIFTSHIELD_AVAILABILITY_ZONE=
+SWIFTSHIELD_SERVER_ID=223a6632-2fba-456b-b8c7-24b3786c320a
+SWIFTSHIELD_SERVER_NAME=SwiftShield1
+SWIFTSHIELD_NOTIFY_TELEGRAM=true
+```
+
+Run a dry check:
+
+```bash
+cd /opt/selectel-finder
+. .venv/bin/activate
+python swiftshield_watchdog.py --dry-run
+```
+
+Install the systemd timer:
+
+```bash
+sudo bash deploy_swiftshield_watchdog.sh
+sudo systemctl list-timers 'swiftshield*'
+sudo journalctl -u swiftshield-watchdog.service -n 100 --no-pager
+```
+
+The watchdog actions are intentionally narrow:
+
+- `ACTIVE`: no action.
+- `SHUTOFF`: `start_server`.
+- `SHELVED` or `SHELVED_OFFLOADED`: `unshelve_server`.
+- `PAUSED` or `ERROR`: report and wait for a manual decision.
+
+The dashboard overview reads `SWIFTSHIELD_STATE_FILE` and shows the latest
+server status, last watchdog check, and last successful `start`/`unshelve` time.
+
 ## Безопасность
 
 - Не коммить `.env`, SQLite, логи и списки состояния.

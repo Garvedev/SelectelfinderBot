@@ -287,6 +287,7 @@ TESTER_MAX_ATTEMPTS = int_env("TESTER_MAX_ATTEMPTS", 2)
 _vless_queue_db_raw = optional_env("VLESS_QUEUE_DB")
 VLESS_QUEUE_DB = Path(_vless_queue_db_raw or str(BASE_DIR / "vless_tests.sqlite3"))
 configure_vless_queue(VLESS_QUEUE_DB)
+SWIFTSHIELD_STATE_FILE = Path(optional_env("SWIFTSHIELD_STATE_FILE", str(BASE_DIR / "swiftshield_watchdog_state.json")))
 
 DASHBOARD_ENABLED = bool_env("DASHBOARD_ENABLED", True)
 DASHBOARD_USERNAME = optional_env("DASHBOARD_USERNAME", "admin")
@@ -1710,6 +1711,43 @@ def ts_to_text(value) -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(value))
 
 
+def swiftshield_snapshot() -> dict:
+    state = {}
+    state_error = ""
+    try:
+        if SWIFTSHIELD_STATE_FILE.exists():
+            state = json.loads(SWIFTSHIELD_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        state_error = str(e)
+
+    last_result = state.get("last_result") or {}
+    before = last_result.get("before") or {}
+    after = last_result.get("after") or {}
+    current = after or before
+    status = current.get("status") or ""
+    message = last_result.get("message") or state_error or ("no watchdog data yet" if not state else "")
+    last_run_at = int(state.get("last_run_at") or 0)
+    last_launch_at = int(state.get("last_launch_at") or 0)
+
+    return {
+        "enabled": bool_env("SWIFTSHIELD_ENABLED", False),
+        "server_name": optional_env("SWIFTSHIELD_SERVER_NAME", "SwiftShield1"),
+        "server_id": optional_env("SWIFTSHIELD_SERVER_ID"),
+        "region": optional_env("SWIFTSHIELD_REGION", optional_env("OS_REGION_NAME")),
+        "availability_zone": optional_env("SWIFTSHIELD_AVAILABILITY_ZONE"),
+        "status": status,
+        "ok": last_result.get("ok") if last_result else None,
+        "action": last_result.get("action") or "",
+        "message": redact_text(message),
+        "last_check_at": last_run_at,
+        "last_check_text": ts_to_text(last_run_at),
+        "last_launch_at": last_launch_at,
+        "last_launch_text": ts_to_text(last_launch_at),
+        "last_launch_action": state.get("last_launch_action") or "",
+        "state_file": str(SWIFTSHIELD_STATE_FILE),
+    }
+
+
 def dashboard_snapshot() -> dict:
     fs = get_finder_state()
     with provisioning_lock:
@@ -1747,6 +1785,7 @@ def dashboard_snapshot() -> dict:
         "queue": get_vless_queue_stats(),
         "metrics": dashboard_metrics(),
         "regions": region_diagnostics(),
+        "swiftshield": swiftshield_snapshot(),
         "workers": get_worker_statuses(),
         "tests": get_active_vless_tests(limit=80),
         "audit": get_audit_events(limit=20),
