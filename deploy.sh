@@ -1,17 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 
-APP_DIR="${APP_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
-SERVICE_NAME="${SERVICE_NAME:-finder}"
+APP_DIR="${APP_DIR:-/opt/selectel-finder}"
+SERVICE_NAME="${SERVICE_NAME:-swiftshield-watchdog}"
 SERVICE_USER="${SERVICE_USER:-finder}"
 SERVICE_GROUP="${SERVICE_GROUP:-$SERVICE_USER}"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-
-if [[ "$APP_DIR" == /root/* && "$SERVICE_USER" != "root" ]]; then
-    echo "APP_DIR is under /root; using SERVICE_USER=root because system users cannot traverse /root"
-    SERVICE_USER="root"
-    SERVICE_GROUP="root"
-fi
+TIMER_FILE="/etc/systemd/system/${SERVICE_NAME}.timer"
 
 cd "$APP_DIR"
 
@@ -29,6 +24,12 @@ if [[ "$SERVICE_USER" != "root" ]] && ! id -u "$SERVICE_USER" >/dev/null 2>&1; t
     useradd --system --home "$APP_DIR" --shell /usr/sbin/nologin --gid "$SERVICE_GROUP" "$SERVICE_USER"
 fi
 
+# Legacy finder.service runs the Telegram bot, dashboard and tester API.
+# Keep it disabled so deploys leave only the SwiftShield recovery watchdog active.
+if systemctl list-unit-files finder.service >/dev/null 2>&1; then
+    systemctl disable --now finder.service || true
+fi
+
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install --upgrade pip
@@ -41,14 +42,14 @@ fi
 sed \
     -e "s|^WorkingDirectory=.*|WorkingDirectory=$APP_DIR|" \
     -e "s|^EnvironmentFile=.*|EnvironmentFile=$APP_DIR/.env|" \
-    -e "s|^ExecStart=.*|ExecStart=$APP_DIR/.venv/bin/python $APP_DIR/finder_ru1.py|" \
+    -e "s|^ExecStart=.*|ExecStart=$APP_DIR/.venv/bin/python $APP_DIR/swiftshield_watchdog.py|" \
     -e "s|^User=.*|User=$SERVICE_USER|" \
     -e "s|^Group=.*|Group=$SERVICE_GROUP|" \
     -e "s|^ReadWritePaths=.*|ReadWritePaths=$APP_DIR|" \
-    systemd/finder.service > "$SERVICE_FILE"
+    systemd/swiftshield-watchdog.service > "$SERVICE_FILE"
+
+cp systemd/swiftshield-watchdog.timer "$TIMER_FILE"
 
 systemctl daemon-reload
-systemctl enable "$SERVICE_NAME"
-systemctl restart "$SERVICE_NAME"
-
-systemctl status "$SERVICE_NAME" --no-pager
+systemctl enable --now "$SERVICE_NAME.timer"
+systemctl status "$SERVICE_NAME.timer" --no-pager
