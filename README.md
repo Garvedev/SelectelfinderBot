@@ -1,5 +1,10 @@
 # Selectel Finder
 
+Основной режим развёртывания сейчас — watchdog Selectel: проверка состояния
+сервера каждые 30 секунд и автоматическое включение. `deploy.sh` запускает
+`swiftshield-watchdog.service` и отключает старый `finder.service`.
+Настройка и диагностика описаны в разделе «SwiftShield watchdog» ниже.
+
 Локальный Telegram-бот и web dashboard для поиска подходящих Selectel Floating IP, создания временных VLESS-серверов и проверки ключей телефоном через Termux worker.
 
 Проект рассчитан на наш закрытый сценарий: без публичного сайта, без nginx и без HTTPS. Dashboard отдается тем же Python-процессом, что и API авто-тестера.
@@ -351,32 +356,40 @@ sudo ./deploy.sh
 Управление сервисом:
 
 ```bash
-sudo systemctl status finder --no-pager
-sudo systemctl restart finder
-sudo systemctl stop finder
-sudo journalctl -u finder -f
+sudo systemctl status swiftshield-watchdog --no-pager
+sudo systemctl restart swiftshield-watchdog
+sudo systemctl stop swiftshield-watchdog
+sudo journalctl -u swiftshield-watchdog -f
 ```
 
 ## SwiftShield watchdog
 
-`swiftshield_watchdog.py` is a separate one-shot watchdog for the preemptible
-server `SwiftShield1`. It should run from another server, for example from the
-same host where this SelectelFinder project is deployed.
+`swiftshield_watchdog.py` — отдельный watchdog для сервера `SwiftShield1`.
+Его нужно запускать **на другом сервере**, который продолжит работать при
+выключении SwiftShield1. Для постоянного режима используется `--loop`;
+без флага выполняется одна проверка.
 
-Add these values to `.env`:
+Добавь в `.env` (ID замени на ID своего сервера):
 
 ```env
 SWIFTSHIELD_ENABLED=true
 SWIFTSHIELD_REGION=ru-3
 SWIFTSHIELD_AVAILABILITY_ZONE=
-SWIFTSHIELD_SERVER_ID=223a6632-2fba-456b-b8c7-24b3786c320a
+SWIFTSHIELD_SERVER_ID=YOUR_SERVER_UUID
 SWIFTSHIELD_SERVER_NAME=SwiftShield1
 SWIFTSHIELD_NOTIFY_TELEGRAM=true
+SWIFTSHIELD_CHECK_INTERVAL_SECONDS=30
+SWIFTSHIELD_API_TIMEOUT=10
+SWIFTSHIELD_WAIT_SECONDS=0
 SWIFTSHIELD_OPENSTACK_PROXY=
 SWIFTSHIELD_OPENSTACK_PROXY_FALLBACK_TO_SOCKS5_PROXY=false
 ```
 
-Run a dry check:
+Нужны также параметры `OS_AUTH_URL`, `OS_PROJECT_ID` или `OS_PROJECT_NAME`,
+`OS_USERNAME`, `OS_PASSWORD` из `.env.example`. Для уведомлений нужны
+`TELEGRAM_BOT_TOKEN` и `TELEGRAM_ALLOWED_CHAT_ID`.
+
+Проверка без изменения сервера, состояния watchdog и отправки уведомлений:
 
 ```bash
 cd /opt/selectel-finder
@@ -384,26 +397,84 @@ cd /opt/selectel-finder
 python swiftshield_watchdog.py --dry-run
 ```
 
-Install the systemd timer:
+Установка или обновление службы:
 
 ```bash
 sudo bash deploy_swiftshield_watchdog.sh
-sudo systemctl list-timers 'swiftshield*'
+sudo systemctl status swiftshield-watchdog.service --no-pager
 sudo journalctl -u swiftshield-watchdog.service -n 100 --no-pager
 ```
 
-The watchdog actions are intentionally narrow:
+Скрипт отключает прежний `.timer`, устанавливает постоянный сервис и
+перезапускает его, чтобы обновления применились сразу. `deploy.sh` после
+обновления git вызывает тот же установщик; GitHub Actions использует его же.
+При push в `main` CI сначала обновляет код на хосте, затем запускает установщик
+из актуальной версии с `APP_DIR=DEPLOY_PATH`. Ручная установка служб не нужна.
+Установщик проверяет конфигурацию без запросов к Selectel, отключает старые
+`finder.service` и таймер watchdog, включает автозагрузку и проверяет работу
+новой службы. Если конфигурация неполная, watchdog выключен или включён
+dry-run, деплой завершается ошибкой до остановки старых служб.
+Параметры берутся из существующего GitHub Secret `ENV_FILE`; новые secrets
+для этой миграции не нужны. Интервал по умолчанию — 30 секунд.
 
-- `ACTIVE`: no action.
-- `SHUTOFF`: `start_server`.
-- `SHELVED` or `SHELVED_OFFLOADED`: `unshelve_server`.
-- `PAUSED` or `ERROR`: report and wait for a manual decision.
+Проверка начинается сразу, затем каждые 30 секунд от начала предыдущей.
+Запуск не блокирует следующие проверки даже при старом
+`SWIFTSHIELD_WAIT_SECONDS=300`. Если API вернул ошибку, следующая проверка
+повторит попытку. Пока `task_state` не пуст, новые команды не отправляются.
+Если API или уведомления работают дольше интервала, пропущенные интервалы
+пропускаются: параллельных запросов и серии догоняющих запусков нет.
+`SWIFTSHIELD_API_TIMEOUT` ограничивает отдельный запрос, а не весь цикл.
 
-The dashboard overview reads `SWIFTSHIELD_STATE_FILE` and shows the latest
-server status, last watchdog check, and last successful `start`/`unshelve` time.
-By default, the watchdog does not reuse `SOCKS5_PROXY` for OpenStack API calls,
-because a recovery check should not depend on a proxy that may live on
-`SwiftShield1`.
+| Состояние | Действие |
+| --- | --- |
+| `ACTIVE` | Проверка выполнена, включение не требуется |
+| `SHUTOFF`, `STOPPED` | `start_server` |
+| `SHELVED`, `SHELVED_OFFLOADED`, `EXPIRED` | `unshelve_server` |
+| `PAUSED` | `unpause_server` |
+| `SUSPENDED` | `resume_server` |
+| Переходное состояние или непустой `task_state` | Повторная проверка в следующем цикле |
+| `ERROR` или неизвестное состояние | Ошибка в журнале и уведомление; требуется диагностика |
+
+Watchdog не выключает, не пересоздаёт и не перезагружает сервер.
+`SWIFTSHIELD_SERVER_ID`, если задан, имеет приоритет: при ошибке запроса по ID
+бот не переключается на другой сервер с таким же именем.
+Если операция облака не меняется более 300 секунд, бот отправляет уведомление
+о зависшей операции; порог — `SWIFTSHIELD_OPERATION_TIMEOUT_SECONDS`.
+Для `SWIFTSHIELD_AVAILABILITY_ZONE` при unshelve нужен
+`OS_COMPUTE_API_VERSION=2.77` или выше и поддержка этой версии облаком.
+Обычно зону следует оставить пустой.
+
+По умолчанию проверяется состояние ВМ через API. Для дополнительной проверки
+прикладного TCP-порта укажи `SWIFTSHIELD_HEALTH_HOST` (IP или DNS),
+`SWIFTSHIELD_HEALTH_PORT=443`, `SWIFTSHIELD_HEALTH_TIMEOUT=3`.
+Закрытый порт у работающей ВМ приводит к уведомлению, без перезагрузки ВМ.
+Открытый TCP-порт сам по себе не подтверждает корректность VLESS или приложения.
+
+Состояние записывается в `SWIFTSHIELD_STATE_FILE`: последняя проверка,
+изменения статуса, запрос восстановления и подтверждённое достижение `ACTIVE`.
+`last_launch_at` обновляется после наблюдения `ACTIVE`, а не после принятия
+команды API. При новом выключении уведомление снова приходит, даже если
+предыдущее восстановление было менее часа назад.
+Отказ Telegram не прерывает проверки.
+
+По умолчанию watchdog подключается к OpenStack напрямую и удаляет
+унаследованные HTTP/SOCKS proxy из своего окружения. Если требуется отдельный
+независимый прокси, задай `SWIFTSHIELD_OPENSTACK_PROXY` или `OPENSTACK_PROXY`.
+Прокси на самом SwiftShield1 для восстановления не подходит.
+
+Прерываемый сервер Selectel может быть остановлен в любой момент при нехватке
+ресурсов. После восстановления он остаётся прерываемым. При локальном
+загрузочном диске восстановление не сохраняет данные диска — это свойство
+услуги, watchdog не может его изменить.
+См. [описание прерываемых серверов](https://docs.selectel.ru/cloud-servers/about/preemptible-servers/)
+и [восстановление](https://docs.selectel.ru/cloud-servers/manage/restore-preemptible-server/).
+
+Локальные проверки:
+
+```bash
+python -m unittest discover -s tests -v
+bash -n deploy.sh deploy_swiftshield_watchdog.sh
+```
 
 ## Безопасность
 

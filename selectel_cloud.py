@@ -1,4 +1,5 @@
 import base64
+import shlex
 import socket
 import time
 from dataclasses import dataclass, field
@@ -417,7 +418,7 @@ def make_cloud_init_script(config: SelectelCloudConfig) -> str:
         "apt-get install -y curl\n"
         "cd /root\n"
         "curl -fsSLO https://raw.githubusercontent.com/denpiligrim/3dp-manager/main/forwarding_install.sh\n"
-        f"export ORIGIN_IP=\"{config.provision_origin_ip}\"\n"
+        f"export ORIGIN_IP={shlex.quote(config.provision_origin_ip)}\n"
         "sudo -E bash forwarding_install.sh\n"
     )
 

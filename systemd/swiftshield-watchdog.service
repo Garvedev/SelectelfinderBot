@@ -4,15 +4,21 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=oneshot
+Type=simple
 User=finder
 Group=finder
 WorkingDirectory=/opt/selectel-finder
 EnvironmentFile=/opt/selectel-finder/.env
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
-ExecStart=/opt/selectel-finder/.venv/bin/python /opt/selectel-finder/swiftshield_watchdog.py
+ExecStart=/opt/selectel-finder/.venv/bin/python /opt/selectel-finder/swiftshield_watchdog.py --loop
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ReadWritePaths=/opt/selectel-finder
+
+[Install]
+WantedBy=multi-user.target
