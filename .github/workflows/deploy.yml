@@ -6,8 +6,16 @@ on:
       - main
   workflow_dispatch:
 
+concurrency:
+  group: selectel-production-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
 jobs:
   deploy:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -16,11 +24,11 @@ jobs:
       DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
       DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
       DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
-      DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
-      ENV_FILE: ${{ secrets.ENV_FILE }}
 
     steps:
       - name: Configure SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
         run: |
           set -euo pipefail
 
@@ -29,7 +37,6 @@ jobs:
           test -n "$DEPLOY_USER"
           test -n "$DEPLOY_PATH"
           test -n "$DEPLOY_SSH_KEY"
-          test -n "$ENV_FILE"
 
           mkdir -p ~/.ssh
           printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
@@ -38,15 +45,45 @@ jobs:
           ssh-keyscan -p "$DEPLOY_PORT" -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
 
       - name: Upload .env from GitHub Secret
+        env:
+          ENV_FILE: ${{ secrets.ENV_FILE }}
         run: |
           set -euo pipefail
 
+          test -n "$ENV_FILE"
+          # GitHub masks the complete multiline secret, but not necessarily
+          # individual values that a remote exception might print later.
+          python3 - <<'PY'
+          import os
+          for line in os.environ["ENV_FILE"].splitlines():
+              stripped = line.strip()
+              if not stripped or stripped.startswith("#"):
+                  continue
+              key = stripped.split("=", 1)[0].upper()
+              if not any(name in key for name in ("TOKEN", "PASSWORD", "PASSWD", "SECRET", "PROXY", "VLESS", "USERNAME", "PRIVATE_KEY")):
+                  continue
+              values = [stripped]
+              if "=" in stripped:
+                  value = stripped.split("=", 1)[1].strip()
+                  values.extend([value, value.strip("\"'")])
+              for value in values:
+                  if value:
+                      escaped = value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+                      print("::add-mask::" + escaped)
+          PY
+
+          printf -v remote_path '%q' "$DEPLOY_PATH"
           printf '%s\n' "$ENV_FILE" | ssh -i ~/.ssh/id_ed25519 -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" \
-            "cat > '$DEPLOY_PATH/.env' && chmod 600 '$DEPLOY_PATH/.env'"
+            "umask 077; cat > $remote_path/.env.deploy && mv -f $remote_path/.env.deploy $remote_path/.env"
 
       - name: Run deploy
         run: |
           set -euo pipefail
 
+          printf -v remote_path '%q' "$DEPLOY_PATH"
           ssh -i ~/.ssh/id_ed25519 -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" \
-            "cd '$DEPLOY_PATH' && chmod +x deploy.sh && sudo bash deploy.sh"
+            "cd $remote_path && sudo git pull --ff-only && sudo env APP_DIR=$remote_path SKIP_GIT_PULL=true bash ./deploy.sh"
+
+      - name: Remove SSH private key
+        if: always()
+        run: rm -f "$HOME/.ssh/id_ed25519"

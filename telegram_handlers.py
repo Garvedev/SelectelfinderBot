@@ -197,7 +197,7 @@ def register_telegram_handlers(ctx):
                 bot.reply_to(message, f"📜 Логи пустые или недоступны: {source}")
                 return
 
-            data = io.BytesIO((text + "\n").encode("utf-8"))
+            data = io.BytesIO((ctx.redact_text(text) + "\n").encode("utf-8"))
             data.name = "finder_last_200_lines.log"
             bot.send_document(message.chat.id, data, caption=f"📜 Последние 200 строк логов ({source})")
         except Exception as e:

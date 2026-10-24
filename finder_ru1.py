@@ -373,7 +373,7 @@ def send(chat_id, text, reply_markup=None):
     try:
         bot.send_message(chat_id, redact_text(text), reply_markup=reply_markup)
     except Exception as e:
-        print(f"Telegram send error: {e}", flush=True)
+        print(f"Telegram send error: {redact_text(e)}", flush=True)
 
 
 def bump_settings_version() -> int:
